@@ -41,7 +41,49 @@ DATASETS = {
         "zip": "eyepacs_2015_resized_hi.zip",
         "approx_gb": 7.79,
     },
+    # External validation cohort (no Kaggle credentials needed). 3,000 colour
+    # fundus photos, ALFEDIAM grades 0-4, 1960-3600 px, CC BY 4.0.
+    # https://zenodo.org/records/23101200  (checksums from the Zenodo record)
+    "fdr26": {
+        "zenodo": "https://zenodo.org/api/records/23101200/files/{name}/content",
+        "files": {
+            "Fundus_FDR26.zip": "be97fb330cb06cadf3926de2ff8be7c9",
+            "metadata_classification_DR.xlsx": "128b725a17177d38e419993c423ad4b9",
+        },
+        "zip": "Fundus_FDR26.zip",
+        "approx_gb": 1.68,
+    },
 }
+
+
+def _md5(path: Path) -> str:
+    import hashlib
+    h = hashlib.md5()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def fetch_zenodo(spec: dict, dest_dir: Path) -> None:
+    """Download Zenodo files with resume and verify each MD5 before use."""
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    for name, md5 in spec["files"].items():
+        dest = dest_dir / name
+        if dest.exists() and _md5(dest) == md5:
+            # already complete: `curl --continue-at -` on a finished file answers 416 and --fail turns that
+            # into an error, so an interrupted-then-restarted run could never get past this point
+            print(f"[zenodo] {name} already present and verified ({md5})")
+            continue
+        url = spec["zenodo"].format(name=name)
+        rc = subprocess.call(["curl", "-L", "--fail", "--retry", "8", "--retry-delay", "5",
+                              "--retry-all-errors", "--continue-at", "-", "-o", str(dest), url])
+        if rc != 0:
+            sys.exit(f"curl failed ({rc}) for {name}")
+        got = _md5(dest)
+        if got != md5:
+            sys.exit(f"checksum mismatch for {name}: got {got}, expected {md5}")
+        print(f"[zenodo] {name} verified ({md5})")
 
 
 def kaggle_credentials() -> tuple[str, str]:
@@ -102,8 +144,22 @@ def main() -> None:
     zip_path = args.out / spec["zip"]
     extract_dir = args.out / args.dataset
 
-    free_gb = shutil.disk_usage(args.out.parent if args.out.exists()
-                                else Path.home()).free / 1e9
+    if args.dataset == "fdr26":
+        if extract_dir.exists() and any(extract_dir.rglob("*.jpg")):
+            print(f"[skip] already extracted at {extract_dir}")
+            return
+        fetch_zenodo(spec, extract_dir)           # zip + xlsx land in extract_dir
+        safe_extract(extract_dir / spec["zip"], extract_dir)
+        if not args.keep_zip:
+            (extract_dir / spec["zip"]).unlink(missing_ok=True)
+        print(f"[next] python scripts/02_preprocess.py --root {extract_dir} --fdr26 "
+              f"--out data/cache_fdr26 --quality-reference data/cache/quality_reference.json")
+        return
+
+    probe = args.out.resolve()
+    while not probe.exists():                 # nearest existing ancestor = the volume that will be used
+        probe = probe.parent
+    free_gb = shutil.disk_usage(probe).free / 1e9
     need = spec["approx_gb"] * 2.2
     if free_gb < need:
         sys.exit(f"Need ~{need:.1f} GB free, only {free_gb:.1f} GB available.")

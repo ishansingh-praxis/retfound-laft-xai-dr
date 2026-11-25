@@ -167,11 +167,25 @@ def protect_large_lesions(native: np.ndarray, clahe_out: np.ndarray,
             + native.astype(np.float32) * mask).astype(np.uint8)
 
 
-def enhance_vessels(bgr: np.ndarray, mask: np.ndarray) -> np.ndarray:
+REF_FIELD = 1024.0   # the field size every pixel-sized constant in this module was tuned at
+
+
+def _scaled(v: float, scale: float, lo: int = 3) -> int:
+    """A kernel/sigma tuned at a 1024 px field, rescaled to the actual cache size.
+
+    Identity at scale 1.0, so the default 1024 px cache is bit-for-bit what it was. At a smaller
+    cache (e.g. 512 px) the same retinal structure spans half as many pixels, so a fixed
+    pixel-sized kernel would act at twice the relative scale.
+    """
+    return max(lo, int(round(v * scale)))
+
+
+def enhance_vessels(bgr: np.ndarray, mask: np.ndarray, scale: float = 1.0) -> np.ndarray:
     """Multi-scale black-top-hat on the green channel -> vessel likelihood."""
     green = bgr[:, :, 1]
     acc = np.zeros_like(green, np.float32)
     for r in (5, 9, 13):
+        r = _scaled(r, scale)
         k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (r, r))
         acc = np.maximum(acc, cv2.morphologyEx(green, cv2.MORPH_BLACKHAT, k).astype(np.float32))
     acc = cv2.GaussianBlur(acc, (3, 3), 0)
@@ -183,7 +197,7 @@ def enhance_vessels(bgr: np.ndarray, mask: np.ndarray) -> np.ndarray:
     return acc
 
 
-def enhance_lesions(bgr: np.ndarray, mask: np.ndarray) -> np.ndarray:
+def enhance_lesions(bgr: np.ndarray, mask: np.ndarray, scale: float = 1.0) -> np.ndarray:
     """Contrast map that favours lesion-scale blobs over vessels.
 
     Bright lesions (exudates) come from a white top-hat on the green channel;
@@ -192,15 +206,17 @@ def enhance_lesions(bgr: np.ndarray, mask: np.ndarray) -> np.ndarray:
     vessels and haemorrhages share intensity but not shape.
     """
     green = bgr[:, :, 1]
-    k_small = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (9, 9))
+    ks = _scaled(9, scale)
+    k_small = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (ks, ks))
     bright = cv2.morphologyEx(green, cv2.MORPH_TOPHAT, k_small).astype(np.float32)
     dark = cv2.morphologyEx(green, cv2.MORPH_BLACKHAT, k_small).astype(np.float32)
     # long structuring element responds to vessels, not to round lesions
-    k_long = cv2.getStructuringElement(cv2.MORPH_RECT, (21, 1))
+    L = _scaled(21, scale, lo=7)
+    k_long = cv2.getStructuringElement(cv2.MORPH_RECT, (L, 1))
     vessel_like = np.zeros_like(dark)
     for ang in range(0, 180, 30):
-        M = cv2.getRotationMatrix2D((10, 0), ang, 1.0)
-        kk = cv2.warpAffine(k_long.astype(np.float32), M, (21, 21)) > 0.5
+        M = cv2.getRotationMatrix2D((L // 2, 0), ang, 1.0)
+        kk = cv2.warpAffine(k_long.astype(np.float32), M, (L, L)) > 0.5
         kk = kk.astype(np.uint8)
         if kk.sum() < 3:
             continue
@@ -247,6 +263,7 @@ def run(bgr: np.ndarray, report: QualityReport, cfg: PreprocCfg) -> PreprocOutpu
     """
     mask = report.fov_mask if report.fov_mask is not None else np.ones(bgr.shape[:2], np.uint8)
     field, fmask = extract_retinal_field(bgr, mask, cfg.cache_size)
+    sc = cfg.cache_size / REF_FIELD     # pixel-sized constants below are defined for a 1024 px field
 
     if getattr(cfg, "raw_pixels", False):
         # Objective 3's decisive experiment: field extraction only, no
@@ -255,14 +272,14 @@ def run(bgr: np.ndarray, report: QualityReport, cfg: PreprocCfg) -> PreprocOutpu
         # vs generic ImageNet backbones is about missing retinal domain
         # knowledge, or about A1/A2 preprocessing not matching the statistics
         # RETFound was itself pretrained on.
-        vessels = enhance_vessels(field, fmask)
-        lesions = enhance_lesions(field, fmask)
+        vessels = enhance_vessels(field, fmask, sc)
+        lesions = enhance_lesions(field, fmask, sc)
         out = field.copy()
         out[fmask == 0] = 0
         return PreprocOutput(image=out, fov_mask=fmask, vessels=vessels,
                              lesion_boost=lesions)
 
-    illum = normalise_illumination(field, fmask, cfg.illum_sigma)
+    illum = normalise_illumination(field, fmask, cfg.illum_sigma * sc)
     algo = getattr(cfg, "enhancement_algorithm", "clahe")
     if algo == "clahe":
         # a lower-quality image gets a higher CLAHE clip limit -> the "adaptive" part
@@ -272,14 +289,14 @@ def run(bgr: np.ndarray, report: QualityReport, cfg: PreprocCfg) -> PreprocOutpu
         # same adaptive schedule (lower quality -> stronger correction),
         # applied to the tile-free local-contrast operator instead
         strength = min(1.0, cfg.local_contrast_strength * (1.0 + 0.8 * (1.0 - report.score)))
-        enhanced_l = local_contrast_normalize(illum, cfg.local_contrast_sigma, strength)
+        enhanced_l = local_contrast_normalize(illum, cfg.local_contrast_sigma * sc, strength)
     if getattr(cfg, "clahe_protect_large_lesions", False):
-        enhanced_l = protect_large_lesions(illum, enhanced_l, cfg.large_lesion_kernel,
+        enhanced_l = protect_large_lesions(illum, enhanced_l, _scaled(cfg.large_lesion_kernel, sc, lo=5),
                                            cfg.large_lesion_protect_strength)
     clahe = enhanced_l   # name kept for the rest of this function / downstream callers
 
-    vessels = enhance_vessels(clahe, fmask)
-    lesions = enhance_lesions(clahe, fmask)
+    vessels = enhance_vessels(clahe, fmask, sc)
+    lesions = enhance_lesions(clahe, fmask, sc)
 
     if report.decision == "enhance":
         # high-resolution enhancement pathway: fold the lesion contrast map back

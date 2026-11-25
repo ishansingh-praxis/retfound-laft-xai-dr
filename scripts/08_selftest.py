@@ -209,6 +209,10 @@ def main() -> None:
         bad = copy.deepcopy(cfg.backbone)
         bad.require_retfound = True
         bad.retfound_ckpt = "/nonexistent/retfound.pth"
+        # no HuggingFace fallback either: with the config default left in place this test resolves a real
+        # RETFound checkpoint from the local HF cache (when one exists) and loads GBs into a tiny model,
+        # i.e. it stops testing "a missing checkpoint is refused" and can crash a small machine
+        bad.retfound_fallback = None
         try:
             RETFoundPlusBackbone(bad, img_size=S)
         except RETFoundCheckpointError as e:
@@ -243,11 +247,40 @@ def main() -> None:
                 assert "lora" in names, st.name
             if st.unfreeze_frac > 0:
                 assert "backbone" in names, st.name
-        assert seen[0][1] == 0 and seen[-1][1] == len(model.backbone.vit.blocks)
-        assert [s[1] for s in seen] == sorted(s[1] for s in seen), "not monotone"
+        main = [(st, x) for st, x in zip(cfg.train.stages, seen) if st.sampling_power is None]
+        crt = [(st, x) for st, x in zip(cfg.train.stages, seen) if st.sampling_power is not None]
+        # the main schedule unfreezes monotonically up to every block
+        assert main[0][1][1] == 0 and main[-1][1][1] == len(model.backbone.vit.blocks)
+        assert [x[1] for _, x in main] == sorted(x[1] for _, x in main), "not monotone"
+        # the decoupled-head stage re-fits only the classifier: no backbone/LoRA gradient
+        for st, x in crt:
+            assert x[1] == 0 and st.sampling_power < 0 and not st.train_backbone and not st.train_lora
+            g = model.set_stage(st)
+            assert g["n_head_params"] > 0
+            assert not any(p.requires_grad for p in model.backbone.vit.parameters()), st.name
         model.set_stage(cfg.train.stages[1])
         return " -> ".join(f"{n}:{u}blk{'+lora' if l else ''}" for n, u, l in seen)
     check("A4 staged fine-tuning schedule", t_stages)
+
+    def t_llrd():
+        st = next(s for s in cfg.train.stages if s.unfreeze_frac >= 1.0 and s.sampling_power is None)
+        model.set_stage(st)
+        flat = model.optimizer_param_groups(st, 0.02)
+        deep = model.optimizer_param_groups(st, 0.02, layer_decay=0.8)
+        n_flat = sum(len(g["params"]) for g in flat if g["name"] == "backbone")
+        bb = [g for g in deep if g["name"].startswith("backbone_L")]
+        assert len(bb) > 2, "layer-wise decay produced no depth groups"
+        assert sum(len(g["params"]) for g in bb) == n_flat, "LLRD dropped or duplicated backbone tensors"
+        ids = [id(p) for g in bb for p in g["params"]]
+        assert len(ids) == len(set(ids)), "a tensor is in two LLRD groups"
+        lrs = [g["lr"] for g in bb]
+        assert lrs == sorted(lrs) and lrs[0] < lrs[-1], "LR must grow with depth"
+        assert abs(lrs[-1] - st.backbone_lr) < 1e-12, "top layer must train at the full backbone LR"
+        other = lambda gs: [g["name"] for g in gs if not g["name"].startswith("backbone")]  # noqa: E731
+        assert other(flat) == other(deep), "non-backbone groups changed"
+        model.set_stage(cfg.train.stages[1])
+        return f"{len(bb)} depth groups, embeddings at x{lrs[0] / lrs[-1]:.4f} of the top LR"
+    check("A4 layer-wise LR decay", t_llrd)
 
     out = {}
 
@@ -475,6 +508,169 @@ def main() -> None:
         assert np.allclose(q.sum(1), 1.0, atol=1e-5)
         return f"temperature T={cal.temperature:.3f}; isotonic renormalised OK"
     check("A10 calibrators", t_calib)
+
+    def t_queue_losses():
+        import torch.nn.functional as _F
+        from dr.modules.a6_ordinal import LossQueue, OrdinalHead, dqk_loss
+        torch.manual_seed(0)
+        # queue bookkeeping: FIFO, capped, detached
+        q = LossQueue(10)
+        for _ in range(3):
+            q.push(torch.randn(4, 16, requires_grad=True), torch.softmax(torch.randn(4, 5), 1),
+                   torch.randint(0, 5, (4,)))
+        assert q.n == 10 and not q.proj.requires_grad and not q.probs.requires_grad
+        # contrastive at micro-batch 2: no usable signal alone, a real gradient with the memory
+        raw = torch.randn(2, 16, requires_grad=True)
+        y2 = torch.tensor([2, 2])
+        alone = ordinal_contrastive_loss(_F.normalize(raw, dim=-1), y2, 0.1)
+        assert float(alone) == 0.0, "batch of 2 should give no contrastive signal on its own"
+        big = LossQueue(64)
+        big.push(_F.normalize(torch.randn(64, 16), dim=-1), torch.softmax(torch.randn(64, 5), 1),
+                 torch.randint(0, 5, (64,)))
+        withq = ordinal_contrastive_loss(_F.normalize(raw, dim=-1), y2, 0.1, memory=big)
+        withq.backward()
+        assert float(withq) > 0 and torch.isfinite(withq) and float(raw.grad.abs().sum()) > 0
+        # DQK: finite, differentiable through the batch, different from the 2-sample estimate
+        lg = torch.randn(2, 5, requires_grad=True)
+        yb = torch.tensor([0, 4])
+        d0 = dqk_loss(torch.softmax(lg, 1), yb, 5)
+        d1 = dqk_loss(torch.softmax(lg, 1), yb, 5, memory=big)
+        d1.backward()
+        assert torch.isfinite(d1) and abs(float(d0) - float(d1)) > 1e-6 and float(lg.grad.abs().sum()) > 0
+        # hierarchical: a running positive rate gives the same weights as passing them directly
+        head = OrdinalHead(32)
+        out = head(torch.randn(4, 32))
+        yh = torch.tensor([0, 1, 3, 4])
+        r = torch.tensor([0.5, 0.3, 0.1, 0.02])
+        a = hierarchical_loss(out, yh, (1, 2, 3, 4), pos_rate=r)
+        b = hierarchical_loss(out, yh, (1, 2, 3, 4), pos_weight=((1 - r) / r).clamp(0.5, 20.0))
+        assert torch.allclose(a, b)
+        return (f"queue cap {q.n}; contrastive@B=2 {float(alone):.3f} -> {float(withq):.3f} with memory; "
+                f"DQK {float(d0):.3f} -> {float(d1):.3f}")
+    check("A6 queue-backed batch-statistic losses", t_queue_losses)
+
+    def t_calib_head():
+        from dr.modules.a6_ordinal import OrdinalHead
+        torch.manual_seed(1)
+        head = OrdinalHead(32)
+        o = head(torch.randn(300, 32) * 2.0)
+        yy = torch.randint(0, 5, (300,))
+        z = torch.log(o.class_probs.detach().clamp_min(1e-8))
+        sc = build_calibrator("temperature", 5).fit(z, yy)
+        pc = torch.softmax(sc(z), 1)
+        assert torch.allclose(pc.sum(1), torch.ones(300), atol=1e-5)
+        ident = torch.softmax(z, 1)
+        assert torch.allclose(ident, o.class_probs.detach(), atol=1e-5), "log-prob input must round-trip"
+        return f"calibrates the CORAL class_probs (T={sc.temperature:.3f}), round-trips at T=1"
+    check("A10 calibration on the prediction head", t_calib_head)
+
+    def t_preproc_fixes():
+        from dr.data.eyepacs import photometric_jitter
+        from dr.modules.a2_preprocess import _scaled
+        img = np.zeros((16, 16, 3), np.float32)
+        img[4:12, 4:12] = 0.5
+        out = photometric_jitter(img, 1.1, 0.05)
+        assert out.dtype == np.float32
+        assert float(out[0, 0].sum()) == 0.0 and float(out[15, 15].sum()) == 0.0, \
+            "jitter must leave the black surround untouched"
+        assert bool((out[4:12, 4:12] > 0.5).all()), "jitter must still brighten the retina"
+        assert [_scaled(v, 1.0) for v in (5, 9, 13, 21, 41)] == [5, 9, 13, 21, 41], \
+            "kernels must be unchanged at the reference 1024 px field"
+        assert _scaled(40, 0.5) == 20 and _scaled(5, 0.1) == 3
+        return "jitter confined to the retinal circle; kernels identity at 1024 px, halve at 512 px"
+    check("A2 resolution-scaled kernels + FOV-confined jitter", t_preproc_fixes)
+
+    def t_cache_gaps():
+        import shutil
+        import tempfile
+        import pandas as _pd
+        from dr.data.eyepacs import CachedEyePACS
+        d = Path(tempfile.mkdtemp())
+        try:
+            n_rows, S, M, K = 7, 64, 16, 2
+            rngx = np.random.default_rng(0)
+            np.save(d / "images.npy", rngx.integers(1, 255, (n_rows, S, S, 3), dtype=np.uint8))
+            np.save(d / "lesions.npy", np.zeros((n_rows, 6, M, M), np.uint8))
+            np.save(d / "anatomy.npy", np.zeros((n_rows, 5, M, M), np.uint8))
+            np.save(d / "crops.npy", np.full((n_rows, K, 2), 32, np.float32))
+            keep = [0, 1, 2, 4, 5, 6]                        # row 3 "failed preprocessing": a gap in cache_row
+            _pd.DataFrame({"image_id": [f"{i}_left" for i in keep], "patient_id": [str(i) for i in keep],
+                           "grade": [0, 1, 2, 3, 4, 0], "split": ["train"] * 6,
+                           "cache_row": keep}).to_csv(d / "meta.csv", index=False)
+            c = default_config()
+            c.preproc.global_size, c.preproc.crop_input, c.preproc.crop_size, c.preproc.n_crops = 32, 16, 32, K
+            ds = CachedEyePACS(d, "train", augment=False, cfg=c)
+            for j in range(len(ds)):
+                ds.item(int(ds.idx[j]))                       # the last row used to raise IndexError
+            hard = HardExampleState.empty(int(ds.meta_full["cache_row"].max()) + 1)
+            w = sampling_weights(ds.labels(), ds.meta_indices(), hard, c.sampling)
+            assert w.shape == (6,) and abs(float(w.sum()) - 1.0) < 1e-9
+        finally:
+            shutil.rmtree(d, ignore_errors=True)
+        return "dataset and sampler survive a gap in cache_row (one image failed preprocessing)"
+    check("data: gaps in cache_row (failed images)", t_cache_gaps)
+
+    def t_fdr26_layout():
+        import shutil
+        import tempfile
+        import cv2
+        import pandas as _pd
+        from dr.cohort import load_fdr26_manifest
+        d = Path(tempfile.mkdtemp())
+        try:
+            nest = d / "Fundus_FDR26" / "fundus"             # the archive layout is not known in advance
+            nest.mkdir(parents=True)
+            for i in range(3):
+                cv2.imwrite(str(nest / f"ABCDEFGH{i}.jpg"), np.full((8, 8, 3), 120, np.uint8))
+            _pd.DataFrame({"image_id": [f"ABCDEFGH{i}" for i in range(3)] + ["MISSING"],
+                           "classe": [0, 1, 2, 3]}).to_excel(d / "metadata_classification_DR.xlsx", index=False)
+            m = load_fdr26_manifest(d)
+            assert len(m) == 3 and set(m.grade) == {0, 1, 2}, m
+        finally:
+            shutil.rmtree(d, ignore_errors=True)
+        return "FDR26 manifest finds images wherever the archive put them; missing rows are dropped"
+    check("data: FDR26 loader tolerant to the zip layout", t_fdr26_layout)
+
+    def t_worker_rng():
+        import shutil
+        import tempfile
+        import pandas as _pd
+        from torch.utils.data import DataLoader
+        from dr.data.eyepacs import CachedEyePACS, seed_worker
+        d = Path(tempfile.mkdtemp())
+        try:
+            n_rows, S, M, K = 16, 32, 8, 1
+            np.save(d / "images.npy", np.random.default_rng(1).integers(1, 255, (n_rows, S, S, 3), dtype=np.uint8))
+            np.save(d / "lesions.npy", np.zeros((n_rows, 6, M, M), np.uint8))
+            np.save(d / "anatomy.npy", np.zeros((n_rows, 5, M, M), np.uint8))
+            np.save(d / "crops.npy", np.full((n_rows, K, 2), 16, np.float32))
+            _pd.DataFrame({"image_id": [f"{i}_left" for i in range(n_rows)], "patient_id": [str(i) for i in range(n_rows)],
+                           "grade": [0] * n_rows, "split": ["train"] * n_rows, "cache_row": list(range(n_rows))}
+                          ).to_csv(d / "meta.csv", index=False)
+            c = default_config()
+            c.preproc.global_size, c.preproc.crop_input, c.preproc.crop_size, c.preproc.n_crops = 16, 8, 16, K
+            ds = CachedEyePACS(d, "train", augment=True, cfg=c)
+            # same image, two "workers": with the dataset RNG copied into both they would make identical flip /
+            # jitter decisions; seed_worker must give each worker (and each new loader) its own stream
+            def stream(seed):
+                ds.rng = np.random.default_rng(1234)                              # what a forked worker starts from
+                torch.manual_seed(seed)
+                class _Info:                                                       # emulate get_worker_info()
+                    dataset = ds
+                import torch.utils.data as tud
+                orig = tud.get_worker_info
+                tud.get_worker_info = lambda: _Info()
+                try:
+                    seed_worker(0)
+                finally:
+                    tud.get_worker_info = orig
+                return [float(ds.item(0)["image"].sum()) for _ in range(6)]
+            a, b = stream(11), stream(12)
+            assert a != b, "two workers/epochs replayed the same augmentation stream"
+        finally:
+            shutil.rmtree(d, ignore_errors=True)
+        return "dataloader workers re-seed the augmentation RNG (no replayed flip/jitter decisions)"
+    check("data: per-worker augmentation seeding", t_worker_rng)
 
     def t_gate():
         a = decision_gate(0.2, 0.9, "accept", 0.85, 0.9)

@@ -32,7 +32,9 @@ EyePACS and is clinically useless.
 from __future__ import annotations
 
 import argparse
+import dataclasses
 import json
+import shutil
 import os
 import sys
 import time
@@ -52,7 +54,7 @@ from torch.utils.data import DataLoader
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 from dr.config import CACHE_DIR, OUT_DIR, RAW_DIR, StageCfg, default_config  # noqa: E402
 from dr.csv_export import save_csv_alongside  # noqa: E402
-from dr.data.eyepacs import CachedEyePACS  # noqa: E402
+from dr.data.eyepacs import CachedEyePACS, seed_worker  # noqa: E402
 from dr.metrics import diagnostic_metrics, ordinal_metrics  # noqa: E402
 from dr.model import build_model  # noqa: E402
 from dr.screening import screening_selection_score  # noqa: E402
@@ -63,7 +65,7 @@ from dr.modules.a5_fusion_gnn import pathology_anatomy_consistency  # noqa: E402
 from dr.modules.a6_ordinal import (boundary_loss, coral_decode,  # noqa: E402
                                    class_balanced_focal_loss, dqk_loss,
                                    hierarchical_loss, ordinal_contrastive_loss,
-                                   ordinal_loss)
+                                   ordinal_loss, LossQueue)
 from dr.modules.a9_xai import (attribution_consistency_loss,  # noqa: E402
                                xai_weight_for_stage)
 from dr.modules.a10_uncertainty import build_calibrator  # noqa: E402
@@ -258,9 +260,17 @@ def compute_losses(out: dict, b: dict, cfg, counts_t, w_xai: float, model=None):
     lo = cfg.loss
 
     l_ord = ordinal_loss(ordi, y)
-    l_hier = hierarchical_loss(ordi, y, cfg.head.hierarchy_thresholds)
+    # detached sample memory for the batch-statistic terms (contrastive / DQK / hierarchical
+    # weights); None = per-batch statistics only
+    q = getattr(model, "loss_queue", None) if model is not None else None
+    q = q if (q is not None and q.size > 0 and model.training) else None
+    pos_rate = None
+    if q is not None:
+        _ks = torch.as_tensor(cfg.head.hierarchy_thresholds, device=y.device).unsqueeze(0)
+        pos_rate = q.pos_rate((y.unsqueeze(1) >= _ks).float())
+    l_hier = hierarchical_loss(ordi, y, cfg.head.hierarchy_thresholds, pos_rate=pos_rate)
     l_bnd = boundary_loss(ordi, y, lo.boundary_gamma)
-    l_con = ordinal_contrastive_loss(ordi.projection, y, lo.contrastive_temp)
+    l_con = ordinal_contrastive_loss(ordi.projection, y, lo.contrastive_temp, memory=q)
     l_les = lesion_supervision_loss(
         out["moe"], b["lesion_masks"],
         (b["lesion_masks"].amax((2, 3)) > 0.5).float())
@@ -280,7 +290,7 @@ def compute_losses(out: dict, b: dict, cfg, counts_t, w_xai: float, model=None):
     # --- DR-NOVA: DQK-Loss, attacking the QWK-is-too-low weakness directly --
     l_dqk = None
     if getattr(lo, "use_dqk_loss", False):
-        l_dqk = dqk_loss(ordi.class_probs, y, ordi.class_probs.shape[1])
+        l_dqk = dqk_loss(ordi.class_probs, y, ordi.class_probs.shape[1], memory=q)
         terms["dqk"] = l_dqk
 
     if model is not None and getattr(model, "loss_weighting", None) is not None:
@@ -313,6 +323,8 @@ def compute_losses(out: dict, b: dict, cfg, counts_t, w_xai: float, model=None):
         ps = ps + lo.w_boundary * (ordi.expected_grade - y).abs() ** lo.boundary_gamma
 
     terms["xai"] = l_xai
+    if q is not None:
+        q.push(ordi.projection, ordi.class_probs, y)      # after the loss: a batch never sees itself
     return total, terms, ps
 
 
@@ -346,6 +358,8 @@ def main() -> None:
                     help="epochs without selection-score gain before early stopping")
     ap.add_argument("--global-size", type=int, default=None)
     ap.add_argument("--crop-input", type=int, default=None)
+    ap.add_argument("--crop-size", type=int, default=None,
+                    help="local window size in CACHE pixels (default: config, 320 for a 1024 px cache). Must match the field fraction the cache was built for: 320/1024 = 160/512.")
     ap.add_argument("--n-crops", type=int, default=None)
     ap.add_argument("--workers", type=int, default=None)
     ap.add_argument("--grad-accum", type=int, default=None)
@@ -358,6 +372,16 @@ def main() -> None:
     ap.add_argument("--max-val", type=int, default=None)
     ap.add_argument("--device", type=str, default="auto")
     ap.add_argument("--tag", type=str, default="retfound_plus_laft_xai")
+    ap.add_argument("--noise-weights", type=Path, default=None,
+                    help="CSV with columns image_id,weight from "
+                         "scripts/27_flag_label_noise.py. Multiplies each training "
+                         "image's sampling probability (weight<1 down-weights "
+                         "probable label errors).")
+    ap.add_argument("--crt-epochs", type=int, default=None,
+                    help="epochs of the decoupled-head stage s5_crt (default 3; 0 removes it)")
+    ap.add_argument("--seed", type=int, default=None,
+                    help="training seed (default: config, 1337). Run >=3 seeds with "
+                         "distinct --tag values and report mean +/- SD.")
     ap.add_argument("--select", choices=("ordinal", "screening"), default=None,
                     help="model-selection objective. 'ordinal' = 0.5*QWK + "
                          "0.3*MacroF1 + 0.2*minority recall; 'screening' = the "
@@ -391,6 +415,14 @@ def main() -> None:
                          "initialisation instead of seeding b_k = logit(P(Y>k)) "
                          "on the training class counts (Objective 1 fix, on by "
                          "default).")
+    ap.add_argument("--learned-loss-weights", action="store_true",
+                    help="opt in to learned (Kendall) loss weighting. Off by default: in the "
+                         "32-epoch run every term's weight drifted at the same optimiser-driven "
+                         "rate regardless of its loss scale, so it did not balance anything")
+    ap.add_argument("--loss-queue", type=int, default=None,
+                    help="size of the detached sample memory behind the contrastive, DQK and "
+                         "hierarchical-weight terms (0 = per-batch only). These terms are "
+                         "statistics over a batch and are degenerate at micro-batch 2-8")
     ap.add_argument("--no-learned-loss-weights", action="store_true",
                     help="use the fixed, hand-tuned LossCfg weights (w_ordinal, "
                          "w_hierarchical, ...) instead of learning one "
@@ -402,6 +434,14 @@ def main() -> None:
                     help="enable mixed precision (bf16 on CPU/CUDA-Ampere+, "
                          "fp16+GradScaler on older CUDA). No effect on MPS - "
                          "known-flaky autocast ops there, stays off regardless.")
+    ap.add_argument("--drop-path", type=float, default=None,
+                    help="stochastic-depth rate on the ViT blocks (default: config, 0 = off)")
+    ap.add_argument("--layer-decay", type=float, default=None,
+                    help="layer-wise LR decay for the backbone (0/1 = off). Block i trains at "
+                         "backbone_lr * decay^(depth-i). Use together with --backbone-lr: the "
+                         "default 5e-6 is for a single flat LR and is too small as the top-block LR")
+    ap.add_argument("--backbone-lr", type=float, default=None,
+                    help="override backbone_lr in every stage that trains the backbone")
     ap.add_argument("--ema-decay", type=float, default=None,
                     help="Polyak/EMA decay for the trainable parameters, "
                          "evaluated alongside the raw weights each epoch and "
@@ -463,24 +503,39 @@ def main() -> None:
     if args.no_alpp: cfg.preproc.alpp_enabled = False
     if args.global_size: cfg.preproc.global_size = args.global_size
     if args.crop_input: cfg.preproc.crop_input = args.crop_input
+    if args.crop_size: cfg.preproc.crop_size = args.crop_size
     if args.n_crops is not None: cfg.preproc.n_crops = args.n_crops
     if args.workers is not None: cfg.train.num_workers = args.workers
     if args.grad_accum: cfg.train.grad_accum = args.grad_accum
+    if args.seed is not None: cfg.train.seed = args.seed
     if args.stage_epochs:
         eps = [int(x) for x in args.stage_epochs.split(",")]
         cfg.train.stages = tuple(
             StageCfg(s.name, e, s.train_backbone, s.train_lora, s.unfreeze_frac,
-                     s.head_lr, s.lora_lr, s.backbone_lr, s.train_alpp)
+                     s.head_lr, s.lora_lr, s.backbone_lr, s.train_alpp, s.sampling_power)
             for s, e in zip(cfg.train.stages, eps))
+    if args.crt_epochs is not None:
+        cfg.train.stages = tuple(
+            s for s in (StageCfg(**{**s.__dict__, "epochs": args.crt_epochs})
+                        if s.name == "s5_crt" else s for s in cfg.train.stages)
+            if s.epochs > 0)
     if args.patience is not None:
         if args.patience < 1:
             ap.error("--patience must be at least 1")
         cfg.train.patience = args.patience
     if args.select: cfg.train.select_objective = args.select
     if args.no_init_ladder_from_prior: cfg.train.init_ladder_from_prior = False
+    if args.learned_loss_weights: cfg.loss.learned_weights = True
     if args.no_learned_loss_weights: cfg.loss.learned_weights = False
+    if args.loss_queue is not None: cfg.loss.queue_size = max(0, int(args.loss_queue))
     if args.amp: cfg.train.amp = True
     if args.ema_decay is not None: cfg.train.ema_decay = args.ema_decay
+    if args.drop_path is not None: cfg.backbone.drop_path = args.drop_path
+    if args.layer_decay is not None: cfg.train.layer_decay = args.layer_decay
+    if args.backbone_lr is not None:
+        cfg.train.stages = tuple(
+            dataclasses.replace(s, backbone_lr=args.backbone_lr) if s.backbone_lr > 0 else s
+            for s in cfg.train.stages)
     if args.ladder_lr_mult is not None: cfg.train.ladder_lr_mult = args.ladder_lr_mult
     if args.xai_weight:
         vals = tuple(float(x) for x in args.xai_weight.split(","))
@@ -520,6 +575,15 @@ def main() -> None:
         # monitoring subset only; the reported test metrics use the full split
         val_ds.idx = rng.choice(val_ds.idx, args.max_val, replace=False)
     print(f"[data] train={len(train_ds)}  val={len(val_ds)}")
+    # the config default (1024) is only a default: record the cache that is actually being read, so the
+    # saved config, the crop field fraction and every later script (05, 09, 21) agree with it
+    _S = int(train_ds.images.shape[1])
+    if cfg.preproc.cache_size != _S:
+        print(f"[data] cache is {_S}px (config said {cfg.preproc.cache_size}px) - using {_S}")
+        cfg.preproc.cache_size = _S
+        cfg.save(out_dir / "config.json")
+    if cfg.preproc.crop_size > _S:
+        print(f"[data] WARNING: crop window {cfg.preproc.crop_size}px is larger than the {_S}px cache; pass --crop-size {round(0.3125 * _S)} (the 31% field fraction the lesion encoder was pretrained at)")
     print(f"[data] cache {train_ds.images.shape[1]}px -> global "
           f"{cfg.preproc.global_size}px + {cfg.preproc.n_crops} local crops "
           f"of {cfg.preproc.crop_size}px fed at {cfg.preproc.crop_input}px")
@@ -536,16 +600,35 @@ def main() -> None:
     # index assigned before the train/val/test split, so it ranges over the
     # whole cache, not 0..len(train subset)-1 - CachedEyePACS's own internal
     # `_hardness` buffer is already sized this way for the same reason.
-    hard = HardExampleState.empty(len(train_ds.meta_full))
+    # indexed by cache_row, which has gaps whenever an image failed preprocessing, so size by the largest
+    # row index, not by the number of rows that survived
+    hard = HardExampleState.empty(int(train_ds.meta_full["cache_row"].max()) + 1)
+
+    noise_extra = None
+    if args.noise_weights:
+        import pandas as _pd2
+        _nw = _pd2.read_csv(args.noise_weights).set_index("image_id")["weight"]
+        _full = train_ds.meta_full
+        _rows = (_full["cache_row"].to_numpy() if "cache_row" in _full.columns
+                 else np.arange(len(_full)))
+        _pos = {int(r): i for i, r in enumerate(_rows)}
+        _ids = _full["image_id"].astype(str).to_numpy()[[_pos[int(m)] for m in meta_idx]]
+        noise_extra = np.array([float(_nw.get(i, 1.0)) for i in _ids], np.float64)
+        print(f"[noise] {int((noise_extra < 1).sum())} of {len(noise_extra)} training "
+              f"images down-weighted (min weight {noise_extra.min():.2f})")
+
+    # stages may override the sampling exponent (s5_crt re-fits the head on balanced data)
+    sampling_now = {"cfg": cfg.sampling}
 
     def build_train_loader(seed: int | None = None):
-        sampler = make_sampler(labels, meta_idx, hard, cfg.sampling,
-                               args.samples_per_epoch, seed=seed)
+        sampler = make_sampler(labels, meta_idx, hard, sampling_now["cfg"],
+                               args.samples_per_epoch, seed=seed, extra=noise_extra)
         return DataLoader(train_ds, batch_size=cfg.train.batch_size,
                           sampler=sampler, num_workers=cfg.train.num_workers,
                           drop_last=True, pin_memory=(device.type == "cuda"),
                           prefetch_factor=(4 if cfg.train.num_workers > 0 else None),
-                          persistent_workers=cfg.train.num_workers > 0)
+                          persistent_workers=cfg.train.num_workers > 0,
+                          worker_init_fn=seed_worker if cfg.train.num_workers > 0 else None)
 
     val_ld = DataLoader(val_ds, batch_size=cfg.train.batch_size, shuffle=False,
                         num_workers=cfg.train.num_workers,
@@ -553,6 +636,8 @@ def main() -> None:
 
     # ---- build model ----------------------------------------------------
     model = build_model(cfg).to(device)
+    # plain attribute (not a parameter or buffer): never enters the state dict, starts empty on resume
+    model.loss_queue = LossQueue(getattr(cfg.loss, "queue_size", 0))
     print(f"[A4] backbone: {cfg.backbone.name}")
 
     # ---- resume support ---------------------------------------------------
@@ -720,6 +805,7 @@ def main() -> None:
     resume_mid_applied = resume_mid_step is None
     t_start = time.time()
     stop = False
+    budget_stop = False
 
     # Writes the same payload shape whether called at true epoch-end or from
     # mid-epoch (see MID_EPOCH_CKPT_EVERY below). `epoch_in_stage_value` is
@@ -769,8 +855,29 @@ def main() -> None:
                 "ep_margin": np.concatenate(ep_margin) if ep_margin else np.empty(0, np.float32),
             }
         tmp_ckpt = out_dir / "checkpoint.pt.tmp"
-        torch.save(ckpt_payload, tmp_ckpt)
-        os.replace(tmp_ckpt, ckpt_path)
+        # A failed write (disk full, quota, antivirus lock, flaky network volume) must not
+        # kill an unattended run: retry, and if it still fails keep training - the previous
+        # checkpoint stays valid (os.replace only happens after a complete write) and
+        # best.pt is saved separately. The only cost is a staler resume point.
+        for attempt in range(3):
+            try:
+                torch.save(ckpt_payload, tmp_ckpt)
+                os.replace(tmp_ckpt, ckpt_path)
+                break
+            except (RuntimeError, OSError) as e:
+                try:
+                    tmp_ckpt.unlink(missing_ok=True)
+                except OSError:
+                    # still locked (antivirus / indexer on Windows): the next attempt overwrites it. Letting this
+                    # escape would kill the run from inside the handler whose whole job is to keep it alive.
+                    pass
+                free = shutil.disk_usage(out_dir).free / 1e9
+                print(f"[checkpoint] WARNING: write failed (attempt {attempt + 1}/3, "
+                      f"{free:.1f} GB free): {type(e).__name__}: {e}", flush=True)
+                time.sleep(5)
+        else:
+            print("[checkpoint] WARNING: giving up on this checkpoint; training continues. "
+                  "Free disk space - a restart would resume from an OLDER checkpoint.", flush=True)
 
     # How often (in micro-batch steps, the same counter the progress print
     # uses) to checkpoint within an epoch. Lowered from 100 to 25 on
@@ -783,11 +890,62 @@ def main() -> None:
     # save frequency is still negligible against the per-step pace.
     MID_EPOCH_CKPT_EVERY = 25
 
+    # --- paper bookkeeping: counts and parameter budgets as JSON ---------
+    # (previously only printed to the console log, so they could not be quoted)
+    try:
+        import pandas as _pd
+        _m = _pd.read_csv(Path(args.cache) / "meta.csv")
+        _sum = {"total_images": int(len(_m)),
+                "total_patients": int(_m["patient_id"].nunique()),
+                "per_split": {}, "seed": int(cfg.train.seed),
+                "sampling": {"power": cfg.sampling.power,
+                             "class_weight_power": cfg.sampling.class_weight_power}}
+        for _sp, _g in _m.groupby("split"):
+            _c = _g["grade"].value_counts().reindex(range(5), fill_value=0).tolist()
+            _sum["per_split"][_sp] = {"images": int(len(_g)),
+                                      "patients": int(_g["patient_id"].nunique()),
+                                      "grade_counts": [int(x) for x in _c]}
+        _tc = _sum["per_split"].get("train", {}).get("grade_counts")
+        if _tc and min(_tc) > 0:
+            _sum["train_imbalance_ratio_max_to_min"] = max(_tc) / min(_tc)
+            _sum["grade4_to_grade0_sampling_weight"] = (
+                (_tc[4] / _tc[0]) ** cfg.sampling.power)
+        (out_dir / "dataset_summary.json").write_text(json.dumps(_sum, indent=2))
+    except Exception as _e:                                    # noqa: BLE001
+        print(f"[summary] dataset_summary.json not written: {_e}")
+    _psum_path = out_dir / "param_summary.json"
+    try:
+        param_log = json.loads(_psum_path.read_text()) if _psum_path.exists() else {}
+    except Exception:                                          # noqa: BLE001
+        param_log = {}
+    param_log["backbone_params"] = int(sum(p.numel() for p in model.backbone.parameters()))
+    param_log["model_total_params"] = int(sum(p.numel() for p in model.parameters()))
+    param_log["retfound_load_report"] = {
+        k: v for k, v in getattr(model.backbone, "load_report", {}).items()
+        if k in ("loaded", "path", "matched_tensors", "checkpoint_tensors",
+                 "missing_keys", "unexpected_keys", "backbone_coverage")}
+
     for si, stage in enumerate(cfg.train.stages):
+        is_crt = getattr(stage, "sampling_power", None) is not None
+        if stop and is_crt and not budget_stop:
+            # an early stop ends the main schedule, not the head re-training that follows it
+            print(f"[stage {si+1}] early stop earlier in the run - still running {stage.name}")
+            stop = False
         if stop:
             break
         if resume is not None and si < resume_stage:
             continue   # fully completed in a previous run of this command
+        if is_crt:
+            sampling_now["cfg"] = dataclasses.replace(cfg.sampling, power=stage.sampling_power)
+            if (out_dir / "best.pt").exists() and not (resume is not None and si == resume_stage):
+                # head re-training starts from the best checkpoint, not the last epoch
+                _ck = torch.load(out_dir / "best.pt", map_location=device, weights_only=False)
+                model.load_state_dict(_ck["model"])
+                print(f"[stage {si+1}] {stage.name}: loaded best checkpoint (epoch "
+                      f"{_ck.get('epoch')}); class-balanced sampling power "
+                      f"{stage.sampling_power}")
+        else:
+            sampling_now["cfg"] = cfg.sampling
         gi = model.set_stage(stage)
         pr = model.param_report()
         print(f"\n{'='*70}\n[stage {si+1}/{len(cfg.train.stages)}] {stage.name} "
@@ -801,9 +959,20 @@ def main() -> None:
               f"lora {stage.lora_lr:.1e} | backbone {stage.backbone_lr:.1e}")
         print(f"  trainable {pr['trainable_params']:,} / {pr['total_params']:,} "
               f"({pr['trainable_pct']}%)\n{'='*70}", flush=True)
+        param_log[stage.name] = {
+            "epochs": stage.epochs, "trainable_params": pr["trainable_params"],
+            "total_params": pr["total_params"], "trainable_pct": pr["trainable_pct"],
+            "unfrozen_blocks": gi["backbone"]["unfrozen_blocks"],
+            "total_blocks": gi["backbone"]["total_blocks"],
+            "lora_trainable": bool(gi["backbone"]["lora_trainable"]),
+            "lr": {"head": stage.head_lr,
+                   "ladder": stage.head_lr * cfg.train.ladder_lr_mult,
+                   "lora": stage.lora_lr, "backbone": stage.backbone_lr}}
+        _psum_path.write_text(json.dumps(param_log, indent=2, default=float))
 
         groups = model.optimizer_param_groups(stage, cfg.train.weight_decay,
-                                              cfg.train.ladder_lr_mult)
+                                              cfg.train.ladder_lr_mult,
+                                              layer_decay=cfg.train.layer_decay)
         if not groups:
             print("  nothing trainable in this stage, skipping")
             continue
@@ -1001,7 +1170,11 @@ def main() -> None:
                     p = out["ordinal"].class_probs
                     top2 = p.topk(2, dim=1).values
                     margin_t = top2[:, 0] - top2[:, 1]
-                    pred_t = p.argmax(1)
+                    # same rank decode as evaluation/selection: argmax of the CORAL categorical
+                    # cannot reach the interior grades when threshold gaps are small, so the
+                    # miner's "adjacent-class error" signal would otherwise be measured on a
+                    # predictor that is never used
+                    pred_t = coral_decode(out["ordinal"].cum_probs)
                     # per_sample/margin are float, cache_row/pred/y are long -
                     # stacking needs one common dtype; float32 represents
                     # every value here (grades 0-4, cache rows < 2^24)
@@ -1049,6 +1222,15 @@ def main() -> None:
                             np.concatenate(ep_pred), np.concatenate(ep_true),
                             np.concatenate(ep_margin), cfg.sampling)
             mr = mining_report(hard, labels, meta_idx)
+            # what the model ACTUALLY saw this epoch, after sampler + mining + noise weights:
+            # the only way to tell whether the stacked re-balancing mechanisms over- or
+            # under-correct (compare with the class mix of the train split)
+            _seen_y = np.concatenate(ep_true)
+            _frac = np.bincount(_seen_y, minlength=cfg.head.n_grades) / max(len(_seen_y), 1)
+            _nat = np.asarray(counts, np.float64) / max(float(np.sum(counts)), 1.0)
+            mr.update({f"sampled_frac_grade_{g}": float(_frac[g]) for g in range(cfg.head.n_grades)})
+            print(f"  [sampling] realised class mix this epoch {np.round(_frac, 3).tolist()} "
+                  f"vs train split {np.round(_nat, 3).tolist()}", flush=True)
             train_ld = build_train_loader(seed=cfg.train.seed + epoch_global)
 
             vm, vprob, vyy, _ = evaluate_split(model, val_ld, device,
@@ -1151,6 +1333,7 @@ def main() -> None:
             if args.time_budget_min and (time.time() - t_start) / 60 > args.time_budget_min:
                 print(f"\n[budget] {args.time_budget_min} min elapsed, stopping cleanly")
                 stop = True
+                budget_stop = True
                 break
 
     # ---- guardrail: Objective 4's exact failure mode, made impossible to ----
@@ -1184,9 +1367,15 @@ def main() -> None:
     model.load_state_dict(ckpt["model"])
     _, vprobs, vy, vlogits = evaluate_split(model, val_ld, device,
                                             cfg.head.n_grades, args.decode)
+    # Calibrate the distribution the model actually predicts from: the CORAL class_probs, as
+    # log-probabilities (softmax(log p / T) == p^(1/T), renormalised). The auxiliary softmax head
+    # (`logits_ce`, vlogits) is NOT the head that produces the predictions, screening scores or
+    # saved probabilities, so a temperature fitted on it says nothing about them. It also
+    # composes with TTA, which averages class_probs.
     cal = build_calibrator(cfg.uncertainty.calibrator, cfg.head.n_grades)
-    cal.fit(torch.as_tensor(vlogits), torch.as_tensor(vy))
-    torch.save({"kind": cfg.uncertainty.calibrator,
+    cal.fit(torch.log(torch.as_tensor(vprobs, dtype=torch.float32).clamp_min(1e-8)),
+            torch.as_tensor(vy))
+    torch.save({"kind": cfg.uncertainty.calibrator, "head": "class_probs",
                 "state": cal.state_dict() if hasattr(cal, "state_dict") else None},
                out_dir / "calibrator.pt")
     if hasattr(cal, "temperature"):

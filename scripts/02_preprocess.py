@@ -37,6 +37,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 from dr.config import CACHE_DIR, RAW_DIR, default_config  # noqa: E402
 from dr.data.eyepacs import (build_manifest, split_by_patient,  # noqa: E402
                              subsample_stratified)
+from dr.cohort import (load_fdr26_manifest, load_kaggle_test_manifest,  # noqa: E402
+                       load_split, minority_first_subsample, save_split)
 from dr.data.lesion_priors import (LesionPriorExtractor,  # noqa: E402
                                    generate_lesion_crops)
 from dr.modules import a1_quality, a2_preprocess  # noqa: E402
@@ -116,7 +118,7 @@ def main() -> None:
     ap.add_argument("--image-size", type=int, default=1024,
                     help="retinal field size written to the cache")
     ap.add_argument("--mask-size", type=int, default=112)
-    ap.add_argument("--n-crops", type=int, default=6)
+    ap.add_argument("--n-crops", type=int, default=8)
     ap.add_argument("--crop-size", type=int, default=320,
                     help="local window size, in cache pixels")
     ap.add_argument("--workers", type=int, default=max(1, mp.cpu_count() - 1))
@@ -137,22 +139,61 @@ def main() -> None:
                          "contrast rather than for RETFound's own pretraining "
                          "statistics, is what suppresses RETFound's frozen-"
                          "feature advantage over generic ImageNet backbones.")
+    ap.add_argument("--minority-first", action="store_true",
+                    help="with --limit: keep every patient with any DR and subsample "
+                         "only the No-DR-only patients (instead of a stratified "
+                         "subsample that preserves the 36:1 imbalance)")
+    ap.add_argument("--split-file", type=Path, default=None,
+                    help="JSON {patient_id: split}. If it exists it is applied "
+                         "verbatim; if not, the split built now is saved there. "
+                         "Freeze this once and reuse it for every run and seed.")
+    ap.add_argument("--fdr26", action="store_true",
+                    help="--root is the FDR26 folder (images/ + "
+                         "metadata_classification_DR.xlsx); external cohort")
+    ap.add_argument("--kaggle-test", action="store_true",
+                    help="--root holds the official Kaggle DR TEST images and "
+                         "--labels-csv is retinopathy_solution.csv; all images go to "
+                         "the 'test' split (use --limit for a stratified subsample)")
+    ap.add_argument("--labels-csv", type=Path, default=None)
     args = ap.parse_args()
+    if args.kaggle_test and not args.labels_csv:
+        ap.error("--kaggle-test needs --labels-csv")
 
     print(f"[manifest] scanning {args.root}")
-    df = build_manifest(args.root)
+    if args.fdr26:
+        df = load_fdr26_manifest(args.root)
+    elif args.kaggle_test:
+        df = load_kaggle_test_manifest(args.root, args.labels_csv)
+    else:
+        df = build_manifest(args.root)
     print(f"[manifest] {len(df)} labelled images, "
           f"{df.patient_id.nunique()} patients")
     print("[manifest] grade distribution:")
     for g, c in df.grade.value_counts().sort_index().items():
         print(f"           grade {g}: {c:6d}  ({100*c/len(df):5.2f}%)")
 
-    if args.limit:
+    if args.limit and args.minority_first:
+        df = minority_first_subsample(df, args.limit, args.seed)
+        print(f"[manifest] minority-first subsample: {len(df)} images "
+              f"({df.patient_id.nunique()} patients), grades "
+              f"{df.grade.value_counts().sort_index().to_dict()}")
+    elif args.limit:
         df = subsample_stratified(df, args.limit, args.seed)
         print(f"[manifest] subsampled to {len(df)} images "
               f"({df.patient_id.nunique()} patients)")
 
-    df = split_by_patient(df, seed=args.seed).reset_index(drop=True)
+    if args.fdr26 or args.kaggle_test:
+        # held-out cohort: never trained on, so every image is evaluation data
+        df["split"] = "test"
+        print("[split] held-out cohort: all images assigned to 'test'")
+    elif args.split_file and Path(args.split_file).exists():
+        df = load_split(df, args.split_file).reset_index(drop=True)
+        print(f"[split] applied frozen split from {args.split_file}")
+    else:
+        df = split_by_patient(df, seed=args.seed).reset_index(drop=True)
+        if args.split_file:
+            save_split(df, args.split_file)
+            print(f"[split] saved frozen split to {args.split_file}")
     print("[split] " + ", ".join(f"{k}={v}" for k, v in
                                  df.split.value_counts().items()))
     # guard against the classic leak
@@ -188,7 +229,8 @@ def main() -> None:
     run_args_path = out / "preprocess_run_args.json"
     this_args = {"root": str(args.root), "limit": args.limit, "image_size": args.image_size,
                  "mask_size": args.mask_size, "n_crops": args.n_crops,
-                 "crop_size": args.crop_size, "raw_pixels": args.raw_pixels}
+                 "crop_size": args.crop_size, "raw_pixels": args.raw_pixels,
+                 "minority_first": args.minority_first}
 
     # --- resume: reuse existing cache files + progress log instead of wiping
     # them, so a run interrupted (crash, reboot, shutdown) part-way through

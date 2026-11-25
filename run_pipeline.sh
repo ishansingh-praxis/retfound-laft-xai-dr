@@ -12,11 +12,18 @@ PY=".venv/bin/python"
 mkdir -p outputs/logs
 
 CACHE_PX=1024
-GLOBAL_PX=224
+GLOBAL_PX=${GLOBAL_PX:-512}   # revised: 512 px global view (1024 px is not used)
 CROP_PX=320
-CROP_IN=224
-N_CROPS=6
-LIMIT=${LIMIT:-6000}   # 1024px cache is ~3.2 MB/image; 6000 keeps it near 19 GB
+CROP_IN=${CROP_IN:-288}
+N_CROPS=${N_CROPS:-8}
+# Minority-first cache: every patient with any DR is kept, No-DR patients fill the
+# rest. 1024 px is ~3.2 MB/image, so 15000 images is ~47 GB. Raise on a big disk.
+LIMIT=${LIMIT:-15000}
+SEED=${SEED:-1337}
+TAG=${TAG:-retfound_plus_laft_xai}
+BS=${BS:-2}            # laptop default; raise on a 24 GB+ GPU
+ACCUM=${ACCUM:-8}
+AMP_FLAG=""; [ "${AMP:-0}" = "1" ] && AMP_FLAG="--amp"
 STAGES="${STAGES:-2,4,4,4}"
 SPE="${SPE:-2000}"
 TRAIN_BUDGET_MIN="${TRAIN_BUDGET_MIN:-330}"
@@ -47,32 +54,67 @@ sys.exit(0 if (d/'crops.npy').exists() and (d/'meta.csv').exists()
 else
 $PY -u scripts/02_preprocess.py --root data/raw/eyepacs-hi --limit "$LIMIT" \
     --image-size "$CACHE_PX" --n-crops "$N_CROPS" --crop-size "$CROP_PX" \
+    --minority-first --split-file data/split.json --seed "$SEED" \
     --workers 5 > outputs/logs/02_preprocess.log 2>&1
 fi
 tail -30 outputs/logs/02_preprocess.log
 
-step "2b pretrain the A3 lesion experts on REAL IDRiD + DDR masks"
-$PY -u scripts/10_lesion_pretrain.py --image-size "$CROP_IN" --batch-size "${PRETRAIN_BS:-6}" \
-    --epochs "${PRETRAIN_EPOCHS:-10}" --crops-per-image 8 > outputs/logs/10_lesion_pretrain.log 2>&1
-tail -15 outputs/logs/10_lesion_pretrain.log
+step "2b pretrain the A3 lesion experts on real DDR lesion masks"
+# (scripts/11_download_lesions.py now fetches DDR only; pass --only idrid ddr for both)
+if [ -f outputs/lesion_pretrain/lesion_encoder.pt ] && [ "${FORCE_PRETRAIN:-0}" != "1" ]; then
+  echo "lesion encoder already trained - skipping (FORCE_PRETRAIN=1 to redo)"
+else
+  $PY -u scripts/10_lesion_pretrain.py --image-size "$CROP_IN" --batch-size "${PRETRAIN_BS:-6}" \
+      --epochs "${PRETRAIN_EPOCHS:-10}" --crops-per-image 8 > outputs/logs/10_lesion_pretrain.log 2>&1
+  tail -15 outputs/logs/10_lesion_pretrain.log
+fi
 
 step "3  staged training"
 ENC=""
 [ -f outputs/lesion_pretrain/lesion_encoder.pt ] && \
   ENC="--lesion-encoder outputs/lesion_pretrain/lesion_encoder.pt"
 $PY -u scripts/03_train.py --stage-epochs "$STAGES" --samples-per-epoch "$SPE" \
-    --max-val 1200 --batch-size 2 --grad-accum 8 \
+    --max-val 5000 --batch-size "$BS" --grad-accum "$ACCUM" $AMP_FLAG \
+    --seed "$SEED" --tag "$TAG" \
     --global-size "$GLOBAL_PX" --crop-input "$CROP_IN" --n-crops "$N_CROPS" \
     --time-budget-min "$TRAIN_BUDGET_MIN" $ENC \
     > outputs/logs/03_train.log 2>&1
 tail -25 outputs/logs/03_train.log
 
 step "4  full evaluation"
-$PY -u scripts/04_evaluate.py --xai-samples 120 > outputs/logs/04_evaluate.log 2>&1
+CK="outputs/$TAG/best.pt"
+# validation + test predictions (with TTA) feed scripts/26_final_evaluation.py
+$PY -u scripts/04_evaluate.py --ckpt "$CK" --split val --tta --xai-samples 0 \
+    > outputs/logs/04_evaluate_val.log 2>&1
+$PY -u scripts/04_evaluate.py --ckpt "$CK" --split test --tta --xai-samples 120 \
+    > outputs/logs/04_evaluate.log 2>&1
 tail -40 outputs/logs/04_evaluate.log
 
 step "9  screening triage"
 $PY -u scripts/09_screening.py > outputs/logs/09_screening.log 2>&1
 tail -20 outputs/logs/09_screening.log
+
+step "5  external cohort: FDR26 (grading metrics only)"
+if [ ! -d data/raw/fdr26/images ]; then
+  $PY -u scripts/01_download_data.py --dataset fdr26 2>&1 | tail -3
+fi
+if [ ! -f data/cache_fdr26/meta.csv ]; then
+  $PY -u scripts/02_preprocess.py --root data/raw/fdr26 --fdr26 --out data/cache_fdr26 \
+      --image-size "$CACHE_PX" --n-crops "$N_CROPS" --crop-size "$CROP_PX" \
+      --quality-reference data/cache/quality_reference.json --workers 5 \
+      > outputs/logs/02_preprocess_fdr26.log 2>&1
+fi
+$PY -u scripts/04_evaluate.py --ckpt "$CK" --split test --tta --cache data/cache_fdr26 \
+    --pred-tag fdr26 --xai-samples 0 --out "outputs/$TAG/evaluation_fdr26.json" \
+    > outputs/logs/04_evaluate_fdr26.log 2>&1
+
+step "6  final evaluation + paper tables"
+$PY -u scripts/26_final_evaluation.py \
+    --val "outputs/$TAG/predictions_val_tta.npz" --test "outputs/$TAG/predictions_test_tta.npz" \
+    --external fdr26="outputs/$TAG/predictions_fdr26.npz" --out "outputs/$TAG/final" \
+    > outputs/logs/26_final.log 2>&1
+tail -30 outputs/logs/26_final.log
+$PY -u scripts/25_paper_tables.py --run "outputs/$TAG" > outputs/logs/25_tables.log 2>&1
+tail -15 outputs/logs/25_tables.log
 
 step "DONE"

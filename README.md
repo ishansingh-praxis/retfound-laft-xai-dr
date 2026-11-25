@@ -16,6 +16,23 @@ Kaggle Diabetic Retinopathy Detection).
 
 > Research prototype. **Not a medical device. Not for clinical use.**
 
+> **Start here (current pipeline).** Everything below this box describes the earlier 224/448 px baseline and
+> its numbers. The current pipeline is run with one resumable command (`run_all.py`); the full description,
+> every option and the verification status are in
+> [`docs/DR_Pipeline_Documentation.pdf`](docs/DR_Pipeline_Documentation.pdf) and [`RUNBOOK.md`](RUNBOOK.md).
+>
+> ```bash
+> export KAGGLE_USERNAME=...  KAGGLE_KEY=...  HF_TOKEN=...       # HF access to YukunZhou/RETFound_mae_natureCFP is granted manually
+> pip install -r requirements.txt
+> python run_all.py --preflight-only                              # GPU, disk, credentials, network; starts nothing long
+> python run_all.py --only selftest,download_eyepacs,download_retfound,download_lesions,download_fdr26
+> python scripts/32_preprocess_check.py --root data/raw/eyepacs-hi --n 200   # look at routing + crop overlays first
+> bash cloud_start.sh                                             # the full study, detached; re-run the same command to resume
+> ```
+>
+> **Verification status:** the self-test (32 checks) and a two-seed run on *synthetic* data pass end to end.
+> It has **not** been run on real EyePACS data or on a CUDA GPU yet; expect first-contact fixes there.
+
 ---
 
 ## Headline result — referral-safety triage

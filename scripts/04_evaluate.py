@@ -160,6 +160,22 @@ def eval_corruption(model, ds, indices, kind, sev, device, bs=24):
 
 
 # --------------------------------------------------------------------------
+def save_predictions(args, ds, idx, y, pred, probs) -> Path:
+    """Per-image predictions (input to scripts/26_final_evaluation.py and 27_flag_label_noise.py)."""
+    pred_dir = Path(args.out).parent if args.out else args.ckpt.parent
+    path = pred_dir / (f"predictions_{args.split}{'_tta' if args.tta else ''}"
+                       f"{'_' + args.pred_tag if args.pred_tag else ''}.npz")
+    pred_dir.mkdir(parents=True, exist_ok=True)
+    meta_sel = ds.meta.iloc[np.asarray(idx, dtype=int)]
+    np.savez_compressed(
+        path, y=np.asarray(y, dtype=np.int64), pred=np.asarray(pred, dtype=np.int64),
+        probs=np.asarray(probs, dtype=np.float32),
+        patient_id=meta_sel["patient_id"].to_numpy().astype(str),
+        image_id=meta_sel["image_id"].to_numpy().astype(str))
+    print(f"[saved] per-image predictions -> {path}")
+    return path
+
+
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--ckpt", type=Path,
@@ -168,6 +184,12 @@ def main() -> None:
     ap.add_argument("--external-cache", type=Path, default=None,
                     help="second preprocessed cache for cross-domain evaluation")
     ap.add_argument("--split", default="test")
+    ap.add_argument("--predictions-only", action="store_true",
+                    help="run inference, save predictions + headline metrics, skip XAI, "
+                         "robustness and deployment sections (cheap pass for val/train/external)")
+    ap.add_argument("--pred-tag", default="",
+                    help="suffix for predictions_<split>[_tta][_<tag>].npz so an "
+                         "external cohort never overwrites the EyePACS predictions")
     ap.add_argument("--xai-samples", type=int, default=150)
     ap.add_argument("--corruption-samples", type=int, default=400)
     ap.add_argument("--mc-samples", type=int, default=8)
@@ -193,7 +215,7 @@ def main() -> None:
     saved = ck.get("config", {})
     # the resolution policy has to come from the checkpoint: evaluating a model
     # trained on 6 crops with the default 6 is luck, not correctness
-    for field in ("backbone", "fusion", "moe", "preproc", "head"):
+    for field in ("backbone", "fusion", "moe", "preproc", "head", "loss"):
         if isinstance(saved, dict) and field in saved:
             setattr(cfg, field, saved[field])
 
@@ -235,6 +257,7 @@ def main() -> None:
     cal_path = args.ckpt.parent / "calibrator.pt"
     cal_probs = probs
     temp = None
+    cal_head = "none (no calibrator.pt)"
     if cal_path.exists():
         cs = torch.load(cal_path, map_location="cpu", weights_only=False)
         if cs.get("state") is not None:
@@ -242,9 +265,38 @@ def main() -> None:
             sc.load_state_dict(cs["state"])
             temp = sc.temperature
             with torch.no_grad():
-                cal_probs = torch.softmax(sc(torch.as_tensor(logits)), 1).numpy()
+                if cs.get("head") == "class_probs":
+                    # fitted on log(class_probs): the same distribution that makes the predictions
+                    z = torch.log(torch.as_tensor(probs, dtype=torch.float32).clamp_min(1e-8))
+                    cal_head = "class_probs"
+                else:
+                    # legacy calibrator.pt: fitted on the auxiliary softmax head, which is NOT
+                    # the head behind `probs`. Kept so old checkpoints still evaluate, but the
+                    # "calibrated" numbers below then describe that auxiliary head only.
+                    z = torch.as_tensor(logits)
+                    cal_head = "logits_ce (legacy, not the prediction head)"
+                    print("[calibration] WARNING: legacy calibrator fitted on the auxiliary "
+                          "softmax head; refit by re-running the end of 03_train.py")
+                cal_probs = torch.softmax(sc(z), 1).numpy()
     report["calibration"] = calibration_metrics(y, cal_probs)
     report["calibration_uncalibrated"] = raw_cal
+    report["calibration_head"] = cal_head
+
+    if args.predictions_only:
+        out_path = Path(args.out) if args.out else args.ckpt.parent / f"evaluation_{args.split}.json"
+        save_predictions(args, ds, idx, y, pred, probs)
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        out_path.write_text(json.dumps({
+            "diagnostic": report["diagnostic"], "ordinal": report["ordinal"],
+            "calibration": report["calibration"], "calibration_uncalibrated": report["calibration_uncalibrated"],
+            "_meta": {"split": args.split, "n_images": int(len(y)),
+                      "n_patients": int(ds.meta["patient_id"].nunique()),
+                      "checkpoint": str(args.ckpt), "temperature": temp, "predictions_only": True,
+                      "grade_distribution": {GRADE_NAMES[k]: int((y == k).sum()) for k in range(5)}}},
+            indent=2, default=float))
+        print(f"[done] predictions-only pass: QWK={report['ordinal']['quadratic_weighted_kappa']:.4f} "
+              f"-> {out_path}")
+        return
 
     # --- 4 lesion / XAI --------------------------------------------------
     print(f"[xai] scoring attribution faithfulness on {args.xai_samples} images")
@@ -388,6 +440,8 @@ def main() -> None:
         "confusion_matrix": [[int(((y == a) & (pred == b)).sum())
                               for b in range(5)] for a in range(5)],
     }
+
+    save_predictions(args, ds, idx, y, pred, probs)
 
     # --- print ------------------------------------------------------------
     print("\n" + "=" * 74)

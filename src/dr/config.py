@@ -79,10 +79,10 @@ class PreprocCfg:
     only has to supply context.
     """
     cache_size: int = 1024       # retinal field stored in the cache
-    global_size: int = 448       # global branch input
+    global_size: int = 512       # global branch input (512 px: ~1024 ViT tokens; 1024 px is not used)
     crop_size: int = 320         # window cut at cache resolution
-    crop_input: int = 224        # window resized to this for the backbone
-    n_crops: int = 6             # 4-8 local lesion crops
+    crop_input: int = 288        # window resized to this for the backbone
+    n_crops: int = 8             # 4-8 local lesion crops
     crop_jitter: float = 0.12    # train-time positional jitter, fraction of crop
     clahe_clip: float = 2.5
     clahe_grid: int = 8
@@ -179,6 +179,9 @@ class BackboneCfg:
     lam_lesion: float = 0.45     # token-energy / lesion-density correlation
     lam_attn: float = 0.20       # attention mass landing on lesion patches
     lesion_layer_boost: float = 0.85  # S_l above this -> forced to r_max
+    # stochastic depth on the ViT blocks (training only; 0 = off). 0.1-0.2 is the usual
+    # range when fine-tuning ViT-L on a small labelled set.
+    drop_path: float = 0.0
 
 
 # --- A5: Bidirectional Pathology-Anatomy Fusion -----------------------------
@@ -255,7 +258,14 @@ class LossCfg:
     weight=1, not these specific numbers - they matter only when
     learned_weights=False).
     """
-    learned_weights: bool = True
+    # Fixed weights are the default. The learned (Kendall) weighting drifted all terms at the
+    # same Adam-driven rate regardless of their loss scale (ord 1.29 and pa 1.29 in the 32-epoch
+    # run although L_ord ~0.3 and L_pa ~0.0004), so it was not balancing anything. Keep it False
+    # unless an ablation shows a gain; checkpoints record the value they were trained with.
+    learned_weights: bool = False
+    # Size of the detached sample memory behind the batch-statistic losses (contrastive, DQK,
+    # hierarchical positive weights). 0 = per-batch statistics only (the previous behaviour).
+    queue_size: int = 0
     # --- DR-NOVA addition: attack QWK directly, not just via proxies -------
     # Every other term here is a proxy for the quadratic-weighted kappa the
     # whole system is judged on; none of them shares its exact reward shape.
@@ -314,6 +324,10 @@ class StageCfg:
     # already force the same full-depth backward, so training ALPP there is
     # free.  Hence: off in stage 1, on afterwards.
     train_alpp: bool = True
+    # Per-stage override of SamplingCfg.power. None = use the global value. The decoupled-
+    # head stage sets -1.0 (class-balanced) so only the classifier is re-fit on balanced
+    # data while the representation, learned under moderate resampling, stays untouched.
+    sampling_power: float | None = None
 
 
 def default_stages() -> tuple[StageCfg, ...]:
@@ -322,6 +336,9 @@ def default_stages() -> tuple[StageCfg, ...]:
         StageCfg("s2_lora",     12,  False, True,  0.00, 1e-4, 5e-5, 0.0, True),
         StageCfg("s3_unfreeze", 14,  True,  True,  0.33, 5e-5, 5e-5, 5e-6, True),
         StageCfg("s4_full",     14,  True,  True,  1.00, 2e-5, 2e-5, 5e-6, True),
+        # decoupled head re-training (cRT): backbone + LoRA frozen, class-balanced sampling,
+        # starts from the best checkpoint and is kept only if the selection score improves
+        StageCfg("s5_crt",       3,  False, False, 0.00, 3e-5, 0.0,  0.0, False, -1.0),
     )
 
 
@@ -367,6 +384,10 @@ class TrainCfg:
                                 # NOW ACTUALLY WIRED UP in 03_train.py (previously dead
                                 # config - defined here but never read anywhere). Safe to
                                 # turn on for cuda/cpu; stays off on mps regardless.
+    # Layer-wise LR decay for the backbone: block i trains at backbone_lr * decay^(depth - i),
+    # so the embeddings and early blocks (general features) move far less than the top
+    # blocks. 0 or 1 = off (one backbone LR, the previous behaviour). 0.7-0.85 is typical.
+    layer_decay: float = 0.0
     ema_decay: float = 0.995   # 0 disables. Tuned for FEW total optimizer steps (a
                                 # small dataset x grad_accum means only ~1-3k steps per
                                 # run) - the usual 0.999/0.9999 seen in large-batch,

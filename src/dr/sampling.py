@@ -99,7 +99,8 @@ def update_hardness(state: HardExampleState, meta_idx: np.ndarray,
 
 def sampling_weights(labels: np.ndarray, meta_idx: np.ndarray,
                      state: HardExampleState | None, cfg: SamplingCfg,
-                     n_grades: int = 5) -> np.ndarray:
+                     n_grades: int = 5,
+                     extra: np.ndarray | None = None) -> np.ndarray:
     """P_i proportional to n_class^power * (1 + H_i)^eta, with the two bonuses."""
     counts = np.bincount(np.asarray(labels), minlength=n_grades).astype(np.float64)
     counts[counts == 0] = 1.0
@@ -111,14 +112,19 @@ def sampling_weights(labels: np.ndarray, meta_idx: np.ndarray,
         mine *= 1.0 + cfg.boundary_bonus * state.boundary[meta_idx]
         mine *= 1.0 + cfg.lowconf_bonus * state.lowconf[meta_idx]
         w = w * mine
+    if extra is not None:
+        # per-sample multiplier, e.g. label-noise down-weighting from
+        # scripts/27_flag_label_noise.py (1.0 = unchanged)
+        w = w * np.asarray(extra, np.float64)
     return (w / w.sum()).astype(np.float64)
 
 
 def make_sampler(labels: np.ndarray, meta_idx: np.ndarray,
                  state: HardExampleState | None, cfg: SamplingCfg,
                  num_samples: int | None = None,
-                 seed: int | None = None) -> WeightedRandomSampler:
-    w = sampling_weights(labels, meta_idx, state, cfg)
+                 seed: int | None = None,
+                 extra: np.ndarray | None = None) -> WeightedRandomSampler:
+    w = sampling_weights(labels, meta_idx, state, cfg, extra=extra)
     # An explicit per-epoch generator (rather than the implicit global RNG)
     # makes the realised draw order reproducible from `seed` alone, regardless
     # of any other randomness consumed elsewhere in the process. This is what

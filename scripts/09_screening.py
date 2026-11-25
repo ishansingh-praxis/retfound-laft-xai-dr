@@ -103,7 +103,7 @@ def main() -> None:
     device = cfg.torch_device()
     ck = torch.load(args.ckpt, map_location="cpu", weights_only=False)
     saved = ck.get("config", {})
-    for field in ("backbone", "fusion", "moe", "preproc", "head"):
+    for field in ("backbone", "fusion", "moe", "preproc", "head", "loss"):
         if isinstance(saved, dict) and field in saved:
             setattr(cfg, field, saved[field])
     model = build_model(cfg)
@@ -166,7 +166,7 @@ def main() -> None:
         out[key] = rows
 
     if ext is not None:
-        print("\nExternal cohort (APTOS) at the same val-selected thresholds:")
+        print("\nExternal cohort at the same val-selected thresholds:")
         for key, (k, label) in TASKS.items():
             print(f"  {label}")
             for r in out[key]:
@@ -178,18 +178,20 @@ def main() -> None:
                           f"refer={e['referral_rate']*100:.1f}% missed={e['missed']}")
 
     # the deployable configuration: safest target that still removes real work
+    # chosen on VALIDATION (the same split the thresholds were fitted on); the numbers reported for the chosen
+    # configuration are then the held-out test ones. Choosing among targets by test NPV would be selection on test.
     deploy = {}
     for key, (k, _label) in TASKS.items():
-        best = None
+        best_val, chosen = None, None
         for r in out[key]:
-            t = r["applied_to_test"]
-            if t["npv"] >= 0.98 and (best is None or
-                                     t["workload_reduction"] > best["workload_reduction"]):
-                best = t
-        if best:
-            deploy[key] = {"threshold": best["threshold"], "npv": best["npv"],
-                           "workload_reduction": best["workload_reduction"],
-                           "sensitivity": best["sensitivity"]}
+            v = r["selected_on_val"]
+            ok = np.isfinite(v["npv"]) and v["npv"] >= 0.98
+            if ok and (best_val is None or v["workload_reduction"] > best_val["workload_reduction"]):
+                best_val, chosen = v, r["applied_to_test"]
+        if chosen:
+            deploy[key] = {"threshold": chosen["threshold"], "npv": chosen["npv"],
+                           "workload_reduction": chosen["workload_reduction"],
+                           "sensitivity": chosen["sensitivity"]}
     out["_deployable"] = deploy
     path = args.ckpt.parent / "screening.json"
     path.write_text(json.dumps(out, indent=2, default=float))
@@ -200,7 +202,7 @@ def main() -> None:
         save_csv_alongside(deploy, path, csv_path=path.with_name("screening_deployable.csv"))
     print(f"\n[saved] {path}")
     if deploy:
-        print("\nDeployable triage configuration (NPV >= 0.98 on held-out test):")
+        print("\nDeployable triage configuration (chosen on validation at NPV >= 0.98; numbers are held-out test):")
         for key, v in deploy.items():
             print(f"  {key:<20} thr={v['threshold']:.3f}  NPV={v['npv']:.4f}  "
                   f"clears {v['workload_reduction']*100:.1f}% of patients  "

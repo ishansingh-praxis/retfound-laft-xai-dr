@@ -451,6 +451,7 @@ class RETFoundPlusBackbone(nn.Module):
         self._resize_fallback_size = None
         self.vit = timm.create_model(cfg.name, pretrained=cfg.pretrained,
                                      num_classes=0, img_size=img_size,
+                                     drop_path_rate=float(getattr(cfg, "drop_path", 0.0)),
                                      dynamic_img_size=True)
         if cfg.retfound_ckpt or cfg.retfound_fallback:
             self.load_report = load_retfound_weights(
@@ -547,6 +548,32 @@ class RETFoundPlusBackbone(nn.Module):
                 continue
             (lora if id(p) in lora_ids else base).append(p)
         return {"lora": lora, "backbone": base}
+
+    def layerwise_groups(self, decay: float) -> list[tuple[int, float, list]]:
+        """Trainable non-LoRA backbone params bucketed by depth, with LLRD multipliers.
+
+        Layer 0 = patch embedding / cls / position tokens, layer i+1 = block i, layer
+        n_blocks+1 = final norm. multiplier = decay ** (n_blocks + 1 - layer), so the
+        last layers train at the full LR and each step towards the input shrinks it.
+        Every parameter that `param_groups()["backbone"]` returns appears in exactly
+        one bucket (checked by the self-test), so no weight is dropped or duplicated.
+        """
+        import re
+        lora_ids = {id(p) for p in lora_parameters(self.vit)}
+        n = self.n_blocks
+        buckets: dict[int, list] = {}
+        for name, p in self.vit.named_parameters():
+            if not p.requires_grad or id(p) in lora_ids:
+                continue
+            m = re.match(r"blocks\.(\d+)\.", name)
+            if m:
+                lid = int(m.group(1)) + 1
+            elif name.startswith(("patch_embed", "cls_token", "pos_embed", "reg_token")):
+                lid = 0
+            else:
+                lid = n + 1
+            buckets.setdefault(lid, []).append(p)
+        return [(lid, float(decay) ** (n + 1 - lid), ps) for lid, ps in sorted(buckets.items())]
 
     # -- forward -----------------------------------------------------------
     def _encode(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, int]:

@@ -111,6 +111,8 @@ def main() -> None:
     saved = ck.get("config", {})
     if isinstance(saved, dict) and "backbone" in saved:
         cfg.backbone, cfg.fusion, cfg.moe = saved["backbone"], saved["fusion"], saved["moe"]
+        if "loss" in saved:        # same loss-weighting module (and so the same state-dict keys)
+            cfg.loss = saved["loss"]
     teacher = build_model(cfg)
     inject_lora(teacher.backbone.vit, (ck.get("gla_lora") or ck.get("allora"))["ranks"], cfg.backbone)
     teacher.load_state_dict(ck["model"])

@@ -180,7 +180,7 @@ def coral_targets(y: torch.Tensor, n_grades: int) -> torch.Tensor:
 
 
 def dqk_loss(class_probs: torch.Tensor, y: torch.Tensor, n_grades: int,
-            eps: float = 1e-6) -> torch.Tensor:
+            eps: float = 1e-6, memory=None) -> torch.Tensor:
     """DQK-Loss - Differentiable Quadratic-weighted Kappa loss.
 
     DR-NOVA addition, attacking the "five-class severity grading is too low"
@@ -209,6 +209,17 @@ def dqk_loss(class_probs: torch.Tensor, y: torch.Tensor, n_grades: int,
     row_marg = y1h.sum(0)                                   # (K,)
     col_marg = class_probs.sum(0)                            # (K,)
     N = class_probs.shape[0]
+    if memory is not None and memory.n > 0:
+        # kappa is a statistic of the WHOLE confusion matrix; on a micro-batch of 2-8 images
+        # it is mostly noise. The queued (detached) entries enlarge the sample the marginals
+        # and the soft confusion matrix are computed on; gradient still flows only through
+        # the current batch.
+        mp = memory.probs.to(class_probs.dtype)
+        my1h = F.one_hot(memory.y, K).to(class_probs.dtype)
+        O = O + my1h.t() @ mp
+        row_marg = row_marg + my1h.sum(0)
+        col_marg = col_marg + mp.sum(0)
+        N = N + memory.n
     E = torch.outer(row_marg, col_marg) / max(N, 1)
     idx = torch.arange(K, device=class_probs.device, dtype=class_probs.dtype)
     w = (idx.unsqueeze(0) - idx.unsqueeze(1)) ** 2 / max((K - 1) ** 2, 1)
@@ -226,7 +237,8 @@ def ordinal_loss(out: OrdinalOutput, y: torch.Tensor,
 
 def hierarchical_loss(out: OrdinalOutput, y: torch.Tensor,
                       thresholds: tuple = (1, 2, 3, 4),
-                      pos_weight: torch.Tensor | None = None) -> torch.Tensor:
+                      pos_weight: torch.Tensor | None = None,
+                      pos_rate: torch.Tensor | None = None) -> torch.Tensor:
     """Binary DR / referable DR / STDR / PDR, each as its own decision.
 
     Every threshold is positive-weighted by its own prevalence in the batch, so
@@ -234,6 +246,11 @@ def hierarchical_loss(out: OrdinalOutput, y: torch.Tensor,
     """
     ks = torch.as_tensor(thresholds, device=y.device).unsqueeze(0)   # (1,H)
     t = (y.unsqueeze(1) >= ks).float()                               # (B,H)
+    if pos_weight is None and pos_rate is not None:
+        # running positive rate of the SAMPLED stream (see LossQueue) instead of this batch's
+        # own counts, which are meaningless at batch size 2-8
+        r = pos_rate.to(t.device, t.dtype).clamp(1e-3, 1 - 1e-3)
+        pos_weight = ((1.0 - r) / r).clamp(0.5, 20.0)
     if pos_weight is None:
         pos = t.sum(0)
         neg = t.shape[0] - pos
@@ -256,28 +273,41 @@ def boundary_loss(out: OrdinalOutput, y: torch.Tensor,
 
 def ordinal_contrastive_loss(projection: torch.Tensor, y: torch.Tensor,
                              temperature: float = 0.1,
-                             distance_weighted: bool = True) -> torch.Tensor:
+                             distance_weighted: bool = True,
+                             memory=None) -> torch.Tensor:
     """Supervised contrastive loss, weighted by ordinal grade distance.
 
     Standard SupCon treats every negative equally, which for an ordinal target
     is wrong: a Moderate pushed away from a Severe should be pushed less hard
     than a Moderate pushed away from a No-DR.  Scaling each negative by
     |y_i - y_j| encodes the severity scale directly into the embedding.
+
+    `memory` (a LossQueue) supplies extra detached keys. Without it the loss only sees the
+    current micro-batch: at batch size 2 the only other sample is the positive (or a negative
+    with no positive), so the term is exactly 0 or undefined - it needs a pool of keys to mean
+    anything. Anchors are always the current batch, so gradient flows only through it.
     """
     B = projection.shape[0]
-    if B < 2:
+    if memory is not None and memory.n > 0:
+        keys = torch.cat([projection, memory.proj.to(projection.dtype)], 0)
+        yk = torch.cat([y.view(-1), memory.y.to(y.device)], 0)
+    else:
+        keys, yk = projection, y.view(-1)
+    if keys.shape[0] < 2:
         return projection.sum() * 0.0
-    sim = projection @ projection.t() / max(temperature, 1e-6)
-    eye = torch.eye(B, device=sim.device, dtype=torch.bool)
-    sim = sim.masked_fill(eye, float("-inf"))
+    sim = projection @ keys.t() / max(temperature, 1e-6)             # (B, N)
+    self_mask = torch.zeros_like(sim, dtype=torch.bool)
+    self_mask[:, :B] = torch.eye(B, device=sim.device, dtype=torch.bool)
+    sim = sim.masked_fill(self_mask, float("-inf"))
 
-    y = y.view(-1, 1)
-    pos = (y == y.t()) & ~eye                                        # (B,B)
+    yq = y.view(-1, 1)
+    ykv = yk.view(1, -1)
+    pos = (yq == ykv) & ~self_mask                                    # (B, N)
     if pos.sum() == 0:
         return projection.sum() * 0.0
 
     if distance_weighted:
-        dist = (y - y.t()).abs().to(sim.dtype)
+        dist = (yq - ykv).abs().to(sim.dtype)
         # negatives further away in grade get a larger weight in the denominator
         w = torch.where(pos, torch.ones_like(dist), 1.0 + dist)
         logits = sim + w.clamp_min(1e-6).log()
@@ -293,6 +323,52 @@ def ordinal_contrastive_loss(projection: torch.Tensor, y: torch.Tensor,
     masked_lp = torch.where(pos, log_prob, torch.zeros_like(log_prob))
     mean_lp = masked_lp.sum(1)[keep] / n_pos[keep]
     return -mean_lp.mean()
+
+
+class LossQueue:
+    """Detached FIFO memory of recent training samples for the batch-statistic losses.
+
+    Three terms are statistics OVER a batch - the supervised-contrastive loss (needs other
+    samples to contrast with), the DQK kappa surrogate (a statistic of the whole confusion
+    matrix) and the positive-class weights of the hierarchical heads. At the micro-batch sizes a
+    large ViT allows (2-8) each is either exactly zero or dominated by noise, and because
+    `auto_batch` picks the batch from GPU memory they would behave differently on different
+    machines. The queue gives each of them a pool of ~`size` recent samples regardless of the
+    micro-batch size. Entries are detached (no gradient) and slightly stale, as in MoCo.
+    `size=0` disables it (the previous per-batch behaviour).
+    """
+
+    def __init__(self, size: int, rate_decay: float = 0.99):
+        self.size = int(size)
+        self.rate_decay = rate_decay
+        self.proj = None
+        self.probs = None
+        self.y = None
+        self._rate = None
+
+    @property
+    def n(self) -> int:
+        return 0 if self.y is None else int(self.y.shape[0])
+
+    def push(self, proj: torch.Tensor, probs: torch.Tensor, y: torch.Tensor) -> None:
+        if self.size <= 0:
+            return
+        p, q, t = proj.detach().float(), probs.detach().float(), y.detach().long()
+        if self.y is None:
+            self.proj, self.probs, self.y = p, q, t
+        else:
+            self.proj = torch.cat([self.proj.to(p.device), p], 0)[-self.size:]
+            self.probs = torch.cat([self.probs.to(q.device), q], 0)[-self.size:]
+            self.y = torch.cat([self.y.to(t.device), t], 0)[-self.size:]
+
+    def pos_rate(self, targets: torch.Tensor) -> torch.Tensor:
+        """Running positive rate per hierarchical head over the sampled stream (EMA)."""
+        cur = targets.detach().float().mean(0)
+        if self._rate is None or self._rate.device != cur.device:
+            self._rate = cur
+        else:
+            self._rate = self.rate_decay * self._rate + (1.0 - self.rate_decay) * cur
+        return self._rate
 
 
 def class_balanced_focal_loss(logits: torch.Tensor, y: torch.Tensor,

@@ -37,10 +37,11 @@ from torch.utils.data import DataLoader, WeightedRandomSampler
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 from dr.config import CACHE_DIR, OUT_DIR, default_config  # noqa: E402
 from dr.csv_export import save_csv_alongside  # noqa: E402
-from dr.data.eyepacs import CachedEyePACS  # noqa: E402
+from dr.data.eyepacs import CachedEyePACS, seed_worker  # noqa: E402
 from dr.metrics import (calibration_metrics, diagnostic_metrics,  # noqa: E402
                         ordinal_metrics)
 from dr.model import build_model  # noqa: E402
+from dr.modules.a6_ordinal import coral_decode_numpy  # noqa: E402
 from dr.modules.a3_lesion_moe import lesion_supervision_loss  # noqa: E402
 from dr.modules.a6_ordinal import class_balanced_focal_loss, ordinal_loss  # noqa: E402
 from dr.modules.a5_fusion_gnn import pathology_anatomy_consistency  # noqa: E402
@@ -73,6 +74,9 @@ BASELINES = [
     ("dinov2_small",     "Transformer", "vit_small_patch14_dinov2.lvd142m", "full"),
     ("vit_small_linear", "Adaptation",  "vit_small_patch16_224",     "linear"),
     ("vit_small_lora",   "Adaptation",  "vit_small_patch16_224",     "lora"),
+    # plain RETFound (needs --retfound-ckpt): the control for the whole system
+    ("retfound_full",    "Foundation",  "vit_large_patch16_224",     "full"),
+    ("retfound_linear",  "Foundation",  "vit_large_patch16_224",     "linear"),
 ]
 
 # proposed-model variants (all use the full A1..A10 pipeline, PLUS the
@@ -102,14 +106,24 @@ class BaselineNet(nn.Module):
     """timm backbone + linear grading head, with the adaptation mode applied."""
 
     def __init__(self, timm_name: str, mode: str, n_grades: int = 5,
-                 img_size: int = 224):
+                 img_size: int = 224, retfound_ckpt: str | None = None):
         super().__init__()
         import timm
         kw = {}
         if "vit_" in timm_name or "deit" in timm_name:
             kw["img_size"] = img_size
-        self.backbone = timm.create_model(timm_name, pretrained=True,
-                                          num_classes=0, **kw)
+        if retfound_ckpt:
+            # the PLAIN RETFound baseline: real CFP weights, no A1-A10 machinery.
+            # This is the model the full system has to beat to justify itself.
+            from dr.modules.a4_backbone_lora import load_retfound_weights
+            self.backbone = timm.create_model(timm_name, pretrained=False,
+                                              num_classes=0, **kw)
+            rep = load_retfound_weights(self.backbone, retfound_ckpt, require=True)
+            print(f"      RETFound coverage {rep['backbone_coverage']:.1%} "
+                  f"({rep['matched_tensors']} tensors)")
+        else:
+            self.backbone = timm.create_model(timm_name, pretrained=True,
+                                              num_classes=0, **kw)
         # measured, not assumed: `num_features` disagrees with the real pooled
         # width on some families (e.g. mobilenetv3 reports 576, emits 1024)
         with torch.no_grad():
@@ -154,7 +168,8 @@ def make_loaders(cache, batch_size, workers, max_train, seed, max_test=None, cfg
                                     len(labels), replacement=True)
     return (DataLoader(tr, batch_size=batch_size, sampler=sampler,
                        num_workers=workers, drop_last=True,
-                       pin_memory=torch.cuda.is_available()),
+                       pin_memory=torch.cuda.is_available(),
+                       worker_init_fn=seed_worker if workers > 0 else None),
             DataLoader(te, batch_size=batch_size, shuffle=False,
                        num_workers=workers, pin_memory=torch.cuda.is_available()),
             torch.as_tensor(np.bincount(labels, minlength=5).astype(np.float32)))
@@ -173,7 +188,9 @@ def eval_baseline(model, loader, device):
 
 def run_baseline(name, timm_name, mode, args, device, loaders):
     train_ld, test_ld, counts = loaders
-    model = BaselineNet(timm_name, mode, img_size=args.image_size).to(device)
+    ckpt = getattr(args, "retfound_ckpt", None) if name.startswith("retfound") else None
+    model = BaselineNet(timm_name, mode, img_size=args.image_size,
+                        retfound_ckpt=ckpt).to(device)
     params = [p for p in model.parameters() if p.requires_grad]
     opt = torch.optim.AdamW(params, lr=args.lr, weight_decay=0.02)
     t0 = time.time()
@@ -200,6 +217,17 @@ def run_proposed(name, ablate, args, device, loaders):
     cfg = default_config()
     cfg.backbone.name = args.backbone
     cfg.preproc.global_size = args.image_size
+    cfg.preproc.cache_size, cfg.preproc.crop_size = args.cache_size, args.crop_size
+    if args.retfound_ckpt and args.backbone.startswith("vit_large"):
+        cfg.backbone.retfound_ckpt = args.retfound_ckpt          # real RETFound weights, hard-checked on load
+    else:
+        # a ViT-Small/Base cannot take the ViT-Large RETFound checkpoint (the config default, which
+        # require_retfound turns into a hard failure for every variant): use the ImageNet initialisation
+        # that the plain baselines use, so the variants are at least matched to them
+        cfg.backbone.require_retfound = False
+        cfg.backbone.retfound_ckpt = None
+        cfg.backbone.retfound_fallback = None
+        cfg.backbone.pretrained = True
     if "_fixed_loss_weights" in ablate:
         cfg.loss.learned_weights = False     # Objective-improvement regression check
     ladder_lr_mult = (1.0 if "_no_ladder_fix" in ablate
@@ -350,6 +378,9 @@ def main() -> None:
                          "focal term; stacking both corrections drives short runs "
                          "to predict rare classes and collapses accuracy.")
     ap.add_argument("--image-size", type=int, default=224)
+    ap.add_argument("--retfound-ckpt", default=None,
+                    help="RETFound CFP weights (path or repo:file). Enables the "
+                         "retfound_full / retfound_linear baselines.")
     ap.add_argument("--backbone", default="vit_small_patch16_224")
     ap.add_argument("--workers", type=int, default=0)
     ap.add_argument("--seed", type=int, default=1337)
@@ -358,6 +389,13 @@ def main() -> None:
     args = ap.parse_args()
 
     cfg = default_config(); cfg.device = args.device
+    # the loaders read the global-view size from this config; the baselines (img_size=args.image_size) and the
+    # proposed variants must be fed the same size, otherwise fixed-size ViTs reject the batch
+    cfg.preproc.global_size = args.image_size
+    _S = int(np.load(Path(args.cache) / "images.npy", mmap_mode="r").shape[1])
+    cfg.preproc.cache_size = _S
+    cfg.preproc.crop_size = int(round(320 * _S / 1024 / 8) * 8)    # same 31% field fraction at any cache size
+    args.cache_size, args.crop_size = _S, cfg.preproc.crop_size
     device = cfg.torch_device()
     args.out.mkdir(parents=True, exist_ok=True)
     keep = set(args.only.split(",")) if args.only else None
@@ -387,7 +425,10 @@ def main() -> None:
     for name, kind, spec in jobs:
         if keep and name not in keep:
             continue
-        if name in results:
+        if name.startswith("retfound") and not args.retfound_ckpt:
+            print(f"[skip] {name}: pass --retfound-ckpt to run the plain RETFound baselines")
+            continue
+        if name in results and "error" not in results[name]:
             print(f"[skip] {name} already in {results_path}")
             continue
         print(f"\n[run] {name} ({kind})", flush=True)
@@ -399,12 +440,23 @@ def main() -> None:
             else:
                 family = "Proposed"
                 p, y, extra = run_proposed(name, spec[0], args, device, loaders)
-            pred = p.argmax(1)
+            # CORAL variants: rank decode, exactly as 03/04 do. argmax of the differenced categorical cannot reach
+            # the interior grades, which would handicap them against the softmax baselines in this table
+            pred = (coral_decode_numpy(p) if (kind == "proposed" and "ordinal" not in spec[0]) else p.argmax(1))
             m = {**diagnostic_metrics(y, pred, p), **ordinal_metrics(y, pred),
                  **calibration_metrics(y, p)}
             results[name] = {"family": family, **extra, **m}
             raw_preds["_y"] = y                     # same test set/order for every entry
             raw_preds[name] = pred
+            # per-model file in the format scripts/26_final_evaluation.py reads
+            # (probs + patient/image ids -> patient-level CIs, DeLong, McNemar)
+            _te = loaders[1].dataset
+            _meta = _te.meta.iloc[np.asarray(_te.idx, dtype=int)]
+            np.savez_compressed(
+                args.out / f"predictions_{name}.npz", y=np.asarray(y, dtype=np.int64),
+                pred=np.asarray(pred, dtype=np.int64), probs=np.asarray(p, dtype=np.float32),
+                patient_id=_meta["patient_id"].to_numpy().astype(str),
+                image_id=_meta["image_id"].to_numpy().astype(str))
             print(f"      acc={m['accuracy']:.4f} QWK={m['quadratic_weighted_kappa']:.4f} "
                   f"refAUC={m['auc_referable_dr']:.4f} "
                   f"trainable={extra['trainable_params']:,} "
@@ -479,6 +531,11 @@ def main() -> None:
     elif "complete" not in raw_preds:
         print("\n[significance] 'complete' has no cached predictions yet - "
               "run it (or don't --only exclude it) to get the significance table.")
+    failed = [k for k, v in results.items() if not k.startswith("_") and "error" in v]
+    if failed:
+        print(f"\n[FAILED ENTRIES] {len(failed)}: " + ", ".join(f"{k} ({results[k]['error'][:60]})" for k in failed))
+    if not keep and ("complete" not in raw_preds or "error" in results.get("complete", {})):
+        sys.exit("the headline entry 'complete' produced no predictions - see the errors above")
 
 
 if __name__ == "__main__":

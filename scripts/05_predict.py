@@ -81,7 +81,7 @@ def load_model(ckpt_path: Path, device):
     cfg = default_config()
     ck = torch.load(ckpt_path, map_location="cpu", weights_only=False)
     saved = ck.get("config", {})
-    for field in ("backbone", "fusion", "moe", "preproc", "head"):
+    for field in ("backbone", "fusion", "moe", "preproc", "head", "loss"):
         if isinstance(saved, dict) and field in saved:
             setattr(cfg, field, saved[field])
     model = build_model(cfg)

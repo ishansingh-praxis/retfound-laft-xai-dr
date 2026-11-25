@@ -125,7 +125,8 @@ class RETFoundPlusLAFTXAI(nn.Module):
                 "n_backbone_params": sum(p.numel() for p in groups["backbone"])}
 
     def optimizer_param_groups(self, stage, weight_decay: float,
-                               ladder_lr_mult: float = 1.0) -> list[dict]:
+                               ladder_lr_mult: float = 1.0,
+                               layer_decay: float = 0.0) -> list[dict]:
         """Four learning rates: ordinal ladder, head, LoRA, backbone.
 
         The CORAL ladder (`ordinal.b0`, `ordinal.deltas`) used to be lumped
@@ -157,8 +158,14 @@ class RETFoundPlusLAFTXAI(nn.Module):
             out.append({"params": groups["lora"], "lr": stage.lora_lr,
                         "weight_decay": 0.0, "name": "lora"})
         if groups["backbone"]:
-            out.append({"params": groups["backbone"], "lr": stage.backbone_lr,
-                        "weight_decay": weight_decay, "name": "backbone"})
+            if layer_decay and 0.0 < layer_decay < 1.0:
+                # layer-wise LR decay: one group per depth, LR shrinking towards the input
+                for lid, scale, ps in self.backbone.layerwise_groups(layer_decay):
+                    out.append({"params": ps, "lr": stage.backbone_lr * scale,
+                                "weight_decay": weight_decay, "name": f"backbone_L{lid}"})
+            else:
+                out.append({"params": groups["backbone"], "lr": stage.backbone_lr,
+                            "weight_decay": weight_decay, "name": "backbone"})
         return out
 
     def init_ordinal_ladder_from_prior(self, class_counts) -> torch.Tensor:

@@ -92,7 +92,9 @@ def fetch(name: str, spec: dict, out_root: Path, attempts: int = 8) -> bool:
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--out", type=Path, default=RAW_DIR / "lesion")
-    ap.add_argument("--only", nargs="*", choices=list(DATASETS), default=None)
+    ap.add_argument("--only", nargs="*", choices=list(DATASETS), default=["ddr"],
+                    help="default: DDR only (the revised plan uses one lesion "
+                         "source). Pass `--only idrid ddr` for both.")
     args = ap.parse_args()
     args.out.mkdir(parents=True, exist_ok=True)
 

@@ -52,7 +52,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 from dr.config import CACHE_DIR, OUT_DIR, RAW_DIR, default_config  # noqa: E402
 from dr.csv_export import save_csv_alongside  # noqa: E402
 from dr.data.eyepacs import CachedEyePACS, batch_from_rows  # noqa: E402
-from dr.data.lesion_datasets import discover_all  # noqa: E402
+from dr.data.lesion_datasets import discover_all, split_records  # noqa: E402
 from dr.data.lesion_priors import LesionPriorExtractor  # noqa: E402
 from dr.model import build_model  # noqa: E402
 from dr.modules import a1_quality, a2_preprocess  # noqa: E402
@@ -190,7 +190,7 @@ def main() -> None:
     device = torch.device(args.device)
     ck = torch.load(args.ckpt, map_location="cpu", weights_only=False)
     saved = ck.get("config", {})
-    for field in ("backbone", "fusion", "moe", "preproc", "head"):
+    for field in ("backbone", "fusion", "moe", "preproc", "head", "loss"):
         if isinstance(saved, dict) and field in saved:
             setattr(cfg, field, saved[field])
 
@@ -211,6 +211,13 @@ def main() -> None:
         if not records:
             raise SystemExit(f"no annotated records under {args.lesion_root}; "
                              f"run scripts/11_download_lesions.py first")
+        # score only images the lesion encoder never trained on: 10_lesion_pretrain.py trains
+        # on the `train` half of this deterministic split, so the held-out half is clean
+        _tr, _held = split_records(records, seed=1337)
+        if _held:
+            records = _held
+            print(f"[data] restricting to the {len(records)} held-out annotated images "
+                  f"(not used by lesion pretraining)")
         rng = np.random.default_rng(1337)
         if args.n and args.n < len(records):
             records = [records[i] for i in
