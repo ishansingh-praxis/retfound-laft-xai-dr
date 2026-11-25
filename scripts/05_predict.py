@@ -23,7 +23,7 @@ import torch
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 from dr.config import OUT_DIR, default_config  # noqa: E402
 from dr.data.lesion_priors import LESION_NAMES, LesionPriorExtractor  # noqa: E402
-from dr.model import build_model  # noqa: E402
+from dr.model import build_model, prepare_for_inference  # noqa: E402
 from dr.modules import a1_quality, a2_preprocess  # noqa: E402
 from dr.modules.a4_backbone_lora import inject_lora  # noqa: E402
 from dr.modules.a9_xai import GradCAM, counterfactual_image  # noqa: E402
@@ -84,6 +84,7 @@ def load_model(ckpt_path: Path, device):
     for field in ("backbone", "fusion", "moe", "preproc", "head", "loss"):
         if isinstance(saved, dict) and field in saved:
             setattr(cfg, field, saved[field])
+    prepare_for_inference(cfg)           # weights come from the checkpoint, not from RETFound
     model = build_model(cfg)
     inject_lora(model.backbone.vit, (ck.get("gla_lora") or ck.get("allora"))["ranks"], cfg.backbone)
     model.load_state_dict(ck["model"])

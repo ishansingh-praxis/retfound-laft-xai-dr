@@ -54,7 +54,7 @@ from dr.csv_export import save_csv_alongside  # noqa: E402
 from dr.data.eyepacs import CachedEyePACS, batch_from_rows  # noqa: E402
 from dr.data.lesion_datasets import discover_all, split_records  # noqa: E402
 from dr.data.lesion_priors import LesionPriorExtractor  # noqa: E402
-from dr.model import build_model  # noqa: E402
+from dr.model import build_model, prepare_for_inference  # noqa: E402
 from dr.modules import a1_quality, a2_preprocess  # noqa: E402
 from dr.modules.a9_xai import GradCAM, counterfactual_image, pointing_game  # noqa: E402
 from dr.modules.external_lesion_batches import (  # noqa: E402
@@ -194,6 +194,7 @@ def main() -> None:
         if isinstance(saved, dict) and field in saved:
             setattr(cfg, field, saved[field])
 
+    prepare_for_inference(cfg)           # weights come from the checkpoint, not from RETFound
     model = build_model(cfg)
     ranks = (ck.get("gla_lora") or ck.get("allora"))["ranks"]
     from dr.modules.a4_backbone_lora import inject_lora

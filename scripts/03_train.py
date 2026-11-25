@@ -423,13 +423,6 @@ def main() -> None:
                     help="size of the detached sample memory behind the contrastive, DQK and "
                          "hierarchical-weight terms (0 = per-batch only). These terms are "
                          "statistics over a batch and are degenerate at micro-batch 2-8")
-    ap.add_argument("--no-learned-loss-weights", action="store_true",
-                    help="use the fixed, hand-tuned LossCfg weights (w_ordinal, "
-                         "w_hierarchical, ...) instead of learning one "
-                         "log-variance per loss term (Kendall et al. 2018, on "
-                         "by default). The learned version removes a whole "
-                         "axis of manual tuning and rebalances automatically "
-                         "as each term's natural scale shifts during training.")
     ap.add_argument("--amp", action="store_true",
                     help="enable mixed precision (bf16 on CPU/CUDA-Ampere+, "
                          "fp16+GradScaler on older CUDA). No effect on MPS - "
@@ -498,6 +491,10 @@ def main() -> None:
     if args.retfound_ckpt:
         cfg.backbone.retfound_ckpt = (
             None if args.retfound_ckpt.lower() == "none" else args.retfound_ckpt)
+        if args.retfound_ckpt.lower() == "none":
+            # "none" must mean none: with the HuggingFace fallback left in place the weights are still resolved
+            # (from the local HF cache or the network) and loaded, silently defeating a no-RETFound run/ablation
+            cfg.backbone.retfound_fallback = None
     if args.allow_no_retfound: cfg.backbone.require_retfound = False
     if args.pretrained: cfg.backbone.pretrained = True
     if args.no_alpp: cfg.preproc.alpp_enabled = False
@@ -526,7 +523,6 @@ def main() -> None:
     if args.select: cfg.train.select_objective = args.select
     if args.no_init_ladder_from_prior: cfg.train.init_ladder_from_prior = False
     if args.learned_loss_weights: cfg.loss.learned_weights = True
-    if args.no_learned_loss_weights: cfg.loss.learned_weights = False
     if args.loss_queue is not None: cfg.loss.queue_size = max(0, int(args.loss_queue))
     if args.amp: cfg.train.amp = True
     if args.ema_decay is not None: cfg.train.ema_decay = args.ema_decay
@@ -863,7 +859,7 @@ def main() -> None:
             try:
                 torch.save(ckpt_payload, tmp_ckpt)
                 os.replace(tmp_ckpt, ckpt_path)
-                break
+                return True
             except (RuntimeError, OSError) as e:
                 try:
                     tmp_ckpt.unlink(missing_ok=True)
@@ -878,6 +874,7 @@ def main() -> None:
         else:
             print("[checkpoint] WARNING: giving up on this checkpoint; training continues. "
                   "Free disk space - a restart would resume from an OLDER checkpoint.", flush=True)
+        return False
 
     # How often (in micro-batch steps, the same counter the progress print
     # uses) to checkpoint within an epoch. Lowered from 100 to 25 on
@@ -1211,10 +1208,11 @@ def main() -> None:
                     # point, while the weights/optimizer/scheduler state and
                     # resume_step captured here let it pick back up at step+1
                     # instead of redoing the epoch from its own start.
-                    write_checkpoint(ep - 1, resume_step=step + 1)
+                    saved = write_checkpoint(ep - 1, resume_step=step + 1)
                     print(f"           [checkpoint] stage {si+1} epoch {ep+1} "
-                          f"step {step+1}/{len(train_ld)} saved (mid-epoch, "
-                          f"resumable at this exact step) -> {ckpt_path}",
+                          f"step {step+1}/{len(train_ld)} "
+                          + (f"saved (mid-epoch, resumable at this exact step) -> {ckpt_path}" if saved
+                             else "NOT SAVED (see the warning above)"),
                           flush=True)
 
             # ---- hard-example mining -------------------------------------
@@ -1323,9 +1321,9 @@ def main() -> None:
             # depends on. (The mid-epoch call above uses the same helper with
             # ep-1 while this one - now that history/best/stale above already
             # reflect epoch `ep` itself - correctly passes ep.)
-            write_checkpoint(ep)
-            print(f"           [checkpoint] stage {si+1} epoch {ep+1} saved "
-                  f"-> {ckpt_path}")
+            saved = write_checkpoint(ep)
+            print(f"           [checkpoint] stage {si+1} epoch {ep+1} "
+                  + (f"saved -> {ckpt_path}" if saved else "NOT SAVED (see the warning above)"))
 
             if stop:
                 break

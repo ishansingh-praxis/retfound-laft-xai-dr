@@ -29,7 +29,7 @@ from dr.config import CACHE_DIR, OUT_DIR, default_config  # noqa: E402
 from dr.csv_export import save_csv_alongside  # noqa: E402
 from dr.data.eyepacs import CachedEyePACS  # noqa: E402
 from dr.metrics import diagnostic_metrics, ordinal_metrics  # noqa: E402
-from dr.model import build_model  # noqa: E402
+from dr.model import build_model, prepare_for_inference  # noqa: E402
 from dr.sampling import HardExampleState, make_sampler  # noqa: E402
 from dr.modules.a6_ordinal import class_balanced_focal_loss  # noqa: E402
 from dr.modules.a4_backbone_lora import inject_lora  # noqa: E402
@@ -113,6 +113,7 @@ def main() -> None:
         cfg.backbone, cfg.fusion, cfg.moe = saved["backbone"], saved["fusion"], saved["moe"]
         if "loss" in saved:        # same loss-weighting module (and so the same state-dict keys)
             cfg.loss = saved["loss"]
+    prepare_for_inference(cfg)           # weights come from the checkpoint, not from RETFound
     teacher = build_model(cfg)
     inject_lora(teacher.backbone.vit, (ck.get("gla_lora") or ck.get("allora"))["ranks"], cfg.backbone)
     teacher.load_state_dict(ck["model"])

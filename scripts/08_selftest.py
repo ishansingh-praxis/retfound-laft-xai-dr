@@ -710,6 +710,31 @@ def main() -> None:
         return "KAGGLE_API_TOKEN (Bearer) beats username+key; secret kept out of logs; newline injection rejected"
     check("data: Kaggle credential resolution", t_kaggle_auth)
 
+    def t_no_pretrain_io():
+        import copy
+        from dr.model import prepare_for_inference
+        c2 = copy.deepcopy(cfg)
+        c2.backbone.retfound_ckpt = "/nonexistent/retfound.pth"
+        c2.backbone.retfound_fallback = "owner/repo:file.pth"      # would be fetched / read from the HF cache
+        c2.backbone.require_retfound = True
+        prepare_for_inference(c2)
+        assert c2.backbone.retfound_ckpt is None and c2.backbone.retfound_fallback is None
+        assert c2.backbone.require_retfound is False
+        calls = []
+        orig = torch.load
+
+        def trap(*a, **k):
+            calls.append(a)
+            raise AssertionError("torch.load was called while rebuilding a model from its own checkpoint")
+        torch.load = trap
+        try:
+            build_model(c2)
+        finally:
+            torch.load = orig
+        assert not calls
+        return "rebuilding a trained model reads no pretraining checkpoint (no HF fallback, no require_retfound)"
+    check("A4 inference rebuild reads no RETFound file", t_no_pretrain_io)
+
     def t_gate():
         a = decision_gate(0.2, 0.9, "accept", 0.85, 0.9)
         b = decision_gate(0.95, 0.9, "accept", 0.85, 0.5)

@@ -26,7 +26,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 from dr.config import CACHE_DIR, OUT_DIR, default_config  # noqa: E402
 from dr.csv_export import save_csv_alongside  # noqa: E402
 from dr.data.eyepacs import CachedEyePACS  # noqa: E402
-from dr.model import build_model  # noqa: E402
+from dr.model import build_model, prepare_for_inference  # noqa: E402
 from dr.modules.a4_backbone_lora import inject_lora  # noqa: E402
 from dr.screening import (apply_operating_point,  # noqa: E402
                           metrics_at, select_operating_point)
@@ -106,6 +106,7 @@ def main() -> None:
     for field in ("backbone", "fusion", "moe", "preproc", "head", "loss"):
         if isinstance(saved, dict) and field in saved:
             setattr(cfg, field, saved[field])
+    prepare_for_inference(cfg)           # weights come from the checkpoint, not from RETFound
     model = build_model(cfg)
     inject_lora(model.backbone.vit, (ck.get("gla_lora") or ck.get("allora"))["ranks"], cfg.backbone)
     model.load_state_dict(ck["model"])

@@ -63,17 +63,18 @@ def parse_args() -> argparse.Namespace:
                          "so --crop-px should shrink with it)")
     ap.add_argument("--crop-px", type=int, default=None,
                     help="local window size in cache pixels (default 320 at 1024 px, scaled with --cache-px)")
-    ap.add_argument("--drop-path", type=float, default=0.1, help="stochastic depth in the ViT (0 = off)")
-    ap.add_argument("--layer-decay", type=float, default=0.8,
+    ap.add_argument("--drop-path", type=float, default=None,
+                    help="stochastic depth in the ViT. Default: off (the config default). Untuned; 0.1 is a common start")
+    ap.add_argument("--layer-decay", type=float, default=None,
                     help="layer-wise LR decay for the backbone (0/1 = off)")
-    ap.add_argument("--backbone-lr", type=float, default=5e-5,
+    ap.add_argument("--backbone-lr", type=float, default=None,
                     help="top-block LR when the backbone trains (with layer decay, lower blocks get less)")
     ap.add_argument("--grad-checkpoint", action="store_true",
                     help="recompute ViT activations in the backward pass (~30% slower, much less memory): use on a 24 GB GPU")
     ap.add_argument("--comparison-backbone", default="vit_small_patch16_224",
                     help="backbone of the PROPOSED variants in the comparison step. The default ViT-Small (ImageNet init) is cheap but is NOT "
                          "matched to the plain RETFound ViT-Large baseline; pass vit_large_patch16_224 for a matched, much slower run")
-    ap.add_argument("--loss-queue", type=int, default=256,
+    ap.add_argument("--loss-queue", type=int, default=None,
                     help="sample memory behind the contrastive / DQK / hierarchical-weight losses "
                          "(0 = per-batch statistics, which are degenerate at micro-batch 2-8)")
     ap.add_argument("--no-ensemble", action="store_true", help="skip the seed-ensemble step")
@@ -496,8 +497,16 @@ def build_plan(r: Runner) -> list[Step]:
             if (r.lesion_out / "lesion_encoder.pt").exists():
                 c += ["--lesion-encoder", r.lesion_out / "lesion_encoder.pt"]
             # regularisation / optimisation for fine-tuning the large ViT (see TrainCfg.layer_decay)
-            c += ["--drop-path", a.drop_path, "--layer-decay", a.layer_decay, "--backbone-lr", a.backbone_lr,
-                  "--loss-queue", a.loss_queue]
+            # Off unless asked for, so `run_all.py` and `03_train.py` run the SAME configuration by default. The smoke
+            # test switches them on so that their code paths are exercised end to end.
+            opt = {"--drop-path": a.drop_path, "--layer-decay": a.layer_decay, "--backbone-lr": a.backbone_lr,
+                   "--loss-queue": a.loss_queue}
+            if sm:
+                for k, v in {"--drop-path": 0.1, "--layer-decay": 0.8, "--backbone-lr": 5e-5, "--loss-queue": 256}.items():
+                    opt[k] = v if opt[k] is None else opt[k]
+            for k, v in opt.items():
+                if v is not None:
+                    c += [k, v]
             if not sm:
                 c += ["--crop-size", crop_px]          # window size must follow the cache resolution
             if a.grad_checkpoint:
@@ -638,7 +647,13 @@ def build_plan(r: Runner) -> list[Step]:
 # ---------------------------------------------------------------------------------------------
 def write_index(r: Runner, ok: bool) -> None:
     lines = [f"# Run '{r.name}' - {'COMPLETE' if ok else 'INCOMPLETE'}", "", f"written {datetime.now():%Y-%m-%d %H:%M:%S}", "",
-             "## Steps", "", "| step | status | seconds | note |", "|---|---|---|---|"]
+             "## Which file is THE result", "",
+             "- **Primary:** `final_ensemble/final_evaluation.md` (seed-averaged probabilities; decoders, cut-points and screening "
+             "thresholds all fitted on the ensemble's own validation scores). With a single seed use `final/final_evaluation.md`.",
+             "- `seed<N>/evaluation.json` is the per-seed 38-parameter report on the test split (as-saved decoder, TTA).",
+             "- `seed<N>/screening.json` is a separate screening analysis WITHOUT test-time augmentation; it is not the headline.",
+             "- `parameters/parameters_master.csv` lists every parameter with its source and status (computed / derived / unavailable).",
+             "", "## Steps", "", "| step | status | seconds | note |", "|---|---|---|---|"]
     for k, v in r.state["steps"].items():
         lines.append(f"| {k} | {v.get('status')} | {v.get('seconds', '')} | {str(v.get('note', ''))[:80]} |")
     lines += ["", "## Key outputs", ""]

@@ -323,6 +323,20 @@ class RETFoundPlusLAFTXAI(nn.Module):
         return self.forward(batch)["z_mc"]
 
 
+def prepare_for_inference(cfg: Config) -> Config:
+    """Config for rebuilding a TRAINED model from its checkpoint.
+
+    The checkpoint's state dict carries every weight, so the pretraining checkpoint is not needed (or loaded):
+    skipping it saves reading ~1.2 GB for every evaluation, and lets a checkpoint be evaluated on a machine that
+    does not have the RETFound file. Without this, the saved `require_retfound` and the HuggingFace fallback made
+    every evaluation re-resolve and re-load the pretraining weights just to overwrite them.
+    """
+    cfg.backbone.retfound_ckpt = None
+    cfg.backbone.retfound_fallback = None
+    cfg.backbone.require_retfound = False
+    return cfg
+
+
 def build_model(cfg: Config) -> RETFoundPlusLAFTXAI:
     torch.manual_seed(cfg.train.seed)
     return RETFoundPlusLAFTXAI(cfg)

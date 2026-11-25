@@ -31,7 +31,7 @@ from dr.metrics import (calibration_metrics, count_reported,  # noqa: E402
                         lesion_xai_metrics, ordinal_metrics, prognosis_metrics,
                         referable_operating_point, robustness_metrics,
                         subgroup_metrics)
-from dr.model import build_model  # noqa: E402
+from dr.model import build_model, prepare_for_inference  # noqa: E402
 from dr.modules.a6_ordinal import coral_decode_numpy  # noqa: E402
 from dr.modules.a9_xai import (GradCAM, attention_rollout,  # noqa: E402
                                counterfactual_image, dice_score, pointing_game)
@@ -219,6 +219,7 @@ def main() -> None:
         if isinstance(saved, dict) and field in saved:
             setattr(cfg, field, saved[field])
 
+    prepare_for_inference(cfg)           # weights come from the checkpoint, not from RETFound
     model = build_model(cfg)
     ranks = (ck.get("gla_lora") or ck.get("allora"))["ranks"]
     from dr.modules.a4_backbone_lora import inject_lora
