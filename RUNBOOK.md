@@ -1,7 +1,8 @@
 # Runbook: one command on a cloud GPU
 
 ```bash
-export KAGGLE_USERNAME=...  KAGGLE_KEY=...   # EyePACS + DDR (Kaggle -> Account -> Create New API Token)
+export KAGGLE_API_TOKEN=...                  # EyePACS + DDR: new-style Kaggle token (Kaggle -> Settings -> API)
+# or the legacy pair:  export KAGGLE_USERNAME=...  KAGGLE_KEY=...   (or a ~/.kaggle/access_token / kaggle.json file)
 export HF_TOKEN=...                          # RETFound weights (request access once on HuggingFace)
 bash cloud_start.sh --smoke                  # ~30 min, synthetic data, CPU: proves every step works
 bash cloud_start.sh                          # the real study

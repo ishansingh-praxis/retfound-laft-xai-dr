@@ -29,24 +29,13 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 from dr.config import RAW_DIR  # noqa: E402
+from dr.kaggle_auth import curl_config, describe, require  # noqa: E402
 
 DATASETS = {
     "idrid": {"slug": "aaryapatel98/indian-diabetic-retinopathy-image-dataset",
               "approx_gb": 0.43},
     "ddr": {"slug": "sunfish141/ddr-segmentation", "approx_gb": 0.64},
 }
-
-
-def credentials() -> tuple[str, str]:
-    u, k = os.environ.get("KAGGLE_USERNAME"), os.environ.get("KAGGLE_KEY")
-    if u and k:
-        return u, k
-    path = Path.home() / ".kaggle" / "kaggle.json"
-    if not path.exists():
-        sys.exit("No Kaggle credentials: set KAGGLE_USERNAME/KAGGLE_KEY or create "
-                 "~/.kaggle/kaggle.json (Kaggle > Account > Create New API Token).")
-    d = json.loads(path.read_text())
-    return d["username"], d["key"]
 
 
 def safe_extract(zip_path: Path, out_dir: Path) -> None:
@@ -64,7 +53,8 @@ def fetch(name: str, spec: dict, out_root: Path, attempts: int = 8) -> bool:
     if dest.exists() and any(dest.rglob("*.tif")):
         print(f"[skip] {name} already extracted at {dest}")
         return True
-    user, key = credentials()
+    creds = require()
+    print(f"[{name}] Kaggle credentials: {describe(creds)}")
     zip_path = out_root / f"{name}.zip"
     url = f"https://www.kaggle.com/api/v1/datasets/download/{spec['slug']}"
     target = spec["approx_gb"] * 9e8
@@ -74,11 +64,12 @@ def fetch(name: str, spec: dict, out_root: Path, attempts: int = 8) -> bool:
         if have >= target:
             break
         print(f"[{name}] attempt {a}, have {have/1e6:.0f} MB")
-        subprocess.call([
+        subprocess.run([
             "curl", "-L", "--fail", "--continue-at", "-",
             "--speed-limit", "20000", "--speed-time", "30",
             "--connect-timeout", "20", "--max-time", "1800",
-            "-u", f"{user}:{key}", "-o", str(zip_path), url])
+            "-K", "-", "-o", str(zip_path), url],          # credentials on stdin, never in argv
+            input=curl_config(creds), text=True)
     if not zip_path.exists() or zip_path.stat().st_size < target:
         print(f"[{name}] download incomplete, skipping")
         return False

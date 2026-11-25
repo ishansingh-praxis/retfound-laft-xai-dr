@@ -9,7 +9,8 @@ statistics -> parameter log -> PDF report.
     python run_all.py --preflight-only # checks credentials / GPU / disk / network and stops
 
 Credentials, as environment variables (nothing is ever written to disk or logged):
-    KAGGLE_USERNAME, KAGGLE_KEY   EyePACS and DDR download (Kaggle account -> Create New API Token)
+    KAGGLE_API_TOKEN              EyePACS and DDR download (new-style Kaggle token), or
+    KAGGLE_USERNAME, KAGGLE_KEY   the legacy pair (Kaggle > Settings > API)
     HF_TOKEN                      RETFound weights (gated repo: request access once on HuggingFace)
 
 Behaviour designed for unattended cloud runs
@@ -367,12 +368,12 @@ def preflight(r: Runner) -> bool:
 
     # credentials (only if the thing they fetch is not already present)
     if not r.smoke:
-        have_kaggle = bool(os.environ.get("KAGGLE_USERNAME") and os.environ.get("KAGGLE_KEY")) or \
-            (Path.home() / ".kaggle" / "kaggle.json").exists()
+        from dr.kaggle_auth import available as _kaggle_ok
+        have_kaggle = _kaggle_ok()          # KAGGLE_API_TOKEN / access_token, or KAGGLE_USERNAME + KAGGLE_KEY / kaggle.json
         have_eye = (r.raw_eye.exists() and any(r.raw_eye.rglob("trainLabels.csv")))
         if not have_eye and not have_kaggle:
-            problems.append("EyePACS is not downloaded and Kaggle credentials are missing: set KAGGLE_USERNAME and "
-                            "KAGGLE_KEY (Kaggle -> Account -> Create New API Token)")
+            problems.append("EyePACS is not downloaded and Kaggle credentials are missing: set KAGGLE_API_TOKEN "
+                            "(new-style token) or KAGGLE_USERNAME and KAGGLE_KEY (Kaggle -> Settings -> API)")
         have_rf = r.retfound.exists() and r.retfound.stat().st_size > 5e8
         if not have_rf and not (os.environ.get("HF_TOKEN") or os.environ.get("HUGGING_FACE_HUB_TOKEN")):
             problems.append("RETFound weights are missing and HF_TOKEN is not set: request access to "

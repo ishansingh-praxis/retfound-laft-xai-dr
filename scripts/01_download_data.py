@@ -29,6 +29,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 from dr.config import RAW_DIR  # noqa: E402
+from dr.kaggle_auth import curl_config, describe, require  # noqa: E402
 
 DATASETS = {
     "eyepacs-224": {
@@ -86,29 +87,20 @@ def fetch_zenodo(spec: dict, dest_dir: Path) -> None:
         print(f"[zenodo] {name} verified ({md5})")
 
 
-def kaggle_credentials() -> tuple[str, str]:
-    env_u, env_k = os.environ.get("KAGGLE_USERNAME"), os.environ.get("KAGGLE_KEY")
-    if env_u and env_k:
-        return env_u, env_k
-    path = Path.home() / ".kaggle" / "kaggle.json"
-    if not path.exists():
-        sys.exit("No Kaggle credentials: set KAGGLE_USERNAME/KAGGLE_KEY or create "
-                 "~/.kaggle/kaggle.json (Kaggle > Account > Create New API Token).")
-    d = json.loads(path.read_text())
-    return d["username"], d["key"]
-
-
 def stream_download(slug: str, dest: Path) -> None:
     """curl with --continue-at so an interrupted pull resumes instead of restarting."""
-    user, key = kaggle_credentials()
+    creds = require()
     url = f"https://www.kaggle.com/api/v1/datasets/download/{slug}"
     dest.parent.mkdir(parents=True, exist_ok=True)
     cmd = ["curl", "-L", "--fail", "--retry", "8", "--retry-delay", "5",
            "--retry-all-errors", "--continue-at", "-",
-           "-u", f"{user}:{key}", "-o", str(dest), url]
-    print(f"[download] {slug}\n[download] -> {dest}")
+           "-K", "-", "-o", str(dest), url]            # credentials come in on stdin, never in argv
+    print(f"[download] {slug}\n[download] -> {dest}\n[download] Kaggle credentials: {describe(creds)}")
     t0 = time.time()
-    rc = subprocess.call(cmd)
+    rc = subprocess.run(cmd, input=curl_config(creds), text=True).returncode
+    if rc in (22, 67):
+        print("[download] HTTP error 401/403 means Kaggle rejected the credentials: check that the token is valid, "
+              "not expired, and (for a dataset) that you have accepted its terms on kaggle.com")
     if rc != 0 and not dest.exists():
         sys.exit(f"curl failed with code {rc}")
     mb = dest.stat().st_size / 1e6

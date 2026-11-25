@@ -22,7 +22,7 @@ Kaggle Diabetic Retinopathy Detection).
 > [`docs/DR_Pipeline_Documentation.pdf`](docs/DR_Pipeline_Documentation.pdf) and [`RUNBOOK.md`](RUNBOOK.md).
 >
 > ```bash
-> export KAGGLE_USERNAME=...  KAGGLE_KEY=...  HF_TOKEN=...       # HF access to YukunZhou/RETFound_mae_natureCFP is granted manually
+> export KAGGLE_API_TOKEN=...  HF_TOKEN=...                      # or KAGGLE_USERNAME=... KAGGLE_KEY=...; HF access to YukunZhou/RETFound_mae_natureCFP is granted manually
 > pip install -r requirements.txt
 > python run_all.py --preflight-only                              # GPU, disk, credentials, network; starts nothing long
 > python run_all.py --only selftest,download_eyepacs,download_retfound,download_lesions,download_fdr26

@@ -83,6 +83,8 @@ def main() -> None:
     cfg.backbone.name = "vit_tiny_patch16_224"
     cfg.backbone.pretrained = False               # offline-safe self-test
     cfg.backbone.retfound_ckpt = None             # the checkpoint gate is tested
+    cfg.backbone.retfound_fallback = None         # no HF fallback either: it would load a real RETFound file from the
+                                                  # local HuggingFace cache (GBs) into this tiny test model
     cfg.backbone.require_retfound = False         # separately, below
     cfg.fusion.fused_dim = 192
     cfg.preproc.cache_size = 512
@@ -671,6 +673,42 @@ def main() -> None:
             shutil.rmtree(d, ignore_errors=True)
         return "dataloader workers re-seed the augmentation RNG (no replayed flip/jitter decisions)"
     check("data: per-worker augmentation seeding", t_worker_rng)
+
+    def t_kaggle_auth():
+        import os
+        import shutil
+        import tempfile
+        from dr import kaggle_auth as ka
+        saved_env = {k: os.environ.get(k) for k in ("KAGGLE_API_TOKEN", "KAGGLE_USERNAME", "KAGGLE_KEY", "HOME", "USERPROFILE")}
+        home = Path(tempfile.mkdtemp())
+        try:
+            for k in ("KAGGLE_API_TOKEN", "KAGGLE_USERNAME", "KAGGLE_KEY"):
+                os.environ.pop(k, None)
+            os.environ["HOME"] = os.environ["USERPROFILE"] = str(home)
+            assert ka.resolve() is None
+            os.environ["KAGGLE_USERNAME"], os.environ["KAGGLE_KEY"] = "fakeuser", "fakekey"
+            assert ka.resolve()["kind"] == "basic"
+            os.environ["KAGGLE_API_TOKEN"] = "KGAT_fake"
+            c = ka.resolve()
+            assert c["kind"] == "bearer", "the new-style token must take precedence over the legacy pair"
+            cfg = ka.curl_config(c)
+            assert cfg.startswith("header = ") and "Authorization: Bearer KGAT_fake" in cfg
+            assert "KGAT_fake" not in ka.describe(c), "what gets logged must not contain the secret"
+            os.environ["KAGGLE_API_TOKEN"] = "KGAT_x\nurl = http://evil.example/"
+            try:
+                ka.resolve()
+                raise AssertionError("a newline in a token must be rejected (curl-config injection)")
+            except ValueError:
+                pass
+        finally:
+            for k, v in saved_env.items():
+                if v is None:
+                    os.environ.pop(k, None)
+                else:
+                    os.environ[k] = v
+            shutil.rmtree(home, ignore_errors=True)
+        return "KAGGLE_API_TOKEN (Bearer) beats username+key; secret kept out of logs; newline injection rejected"
+    check("data: Kaggle credential resolution", t_kaggle_auth)
 
     def t_gate():
         a = decision_gate(0.2, 0.9, "accept", 0.85, 0.9)

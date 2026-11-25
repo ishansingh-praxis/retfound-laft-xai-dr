@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Bootstrap + launch on a fresh cloud GPU machine (Ubuntu/Debian or any Linux with Python >= 3.10).
 #
-#   export KAGGLE_USERNAME=...  KAGGLE_KEY=...  HF_TOKEN=...
+#   export KAGGLE_API_TOKEN=...  HF_TOKEN=...      # new-style Kaggle token; or KAGGLE_USERNAME=... KAGGLE_KEY=...
 #   bash cloud_start.sh                 # the real study
 #   bash cloud_start.sh --smoke         # 30-minute synthetic check of every step first (recommended)
 #   bash cloud_start.sh --seeds 1337    # any run_all.py option can be appended
